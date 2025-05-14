@@ -1,0 +1,34 @@
+---
+- hosts: localhost
+  gather_facts: false
+  name: Connectivity Test & Display ONTAP Info
+  collections:
+    - netapp.ontap
+    
+  module_defaults:
+    group/netapp.ontap.netapp_ontap:
+      hostname: "{{ netapp_hostname }}"
+      username: "{{ netapp_username }}"
+      password: "{{ netapp_password }}"
+      https: true
+      validate_certs: false
+      use_rest: auto
+  vars_prompt:
+    - name: "netapp_password"
+      prompt: "Enter the NetApp Admin Password"
+      private: true
+      confirm: true
+  vars:
+    netapp_hostname: cluster1.demo.netapp.com
+    netapp_username: admin
+
+  tasks:
+
+    - name: "Collect ONTAP info"
+      na_ontap_rest_info:
+        gather_subset: "svm/svms"
+      register: info
+
+    - name: Print ONTAP Response
+      debug:
+        msg: "{{ info }}"

@@ -1,0 +1,20 @@
+---
+- hosts: localhost
+  gather_facts: false
+  name: Connectivity Test & Display ONTAP Info
+
+  tasks:
+
+    - name: "Collect ONTAP info"
+      netapp.ontap.na_ontap_rest_info:
+        hostname: cluster1.demo.netapp.com
+        username: admin
+        password: Netapp1!
+        https: true
+        validate_certs: false
+        gather_subset: "svm/svms"
+      register: info
+
+    - name: Print ONTAP Response
+      debug:
+        msg: "{{ info }}"

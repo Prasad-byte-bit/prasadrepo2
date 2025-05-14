@@ -1,0 +1,8 @@
+netapp_hostname: cluster1.demo.netapp.com
+netapp_username: admin
+vserver: svm1_cluster1
+aggr_name: cluster1_01_SSD_1
+volname: vol3
+protocol: cifs
+size: 10
+client_match: 192.168.0.0/24

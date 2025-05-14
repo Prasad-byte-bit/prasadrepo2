@@ -1,0 +1,28 @@
+[ansible@ansible fundamentals]$ cat run_python_script.yml
+---
+- name: Copy and run Python script using Python 2
+  hosts: all
+  become: yes
+  tasks:
+    - name: Copy Python script to remote host
+      copy:
+        src: get_memory.py
+        dest: /tmp/get_memory.py
+        mode: '0755'
+
+    - name: Run the Python script using python
+      command: python /tmp/get_memory.py
+      register: output
+
+    - name: Show output of script
+      debug:
+        var: output.stdout
+    - name: get file from remote to local
+      fetch:
+        src: /tmp/memory_output/memory_info.txt
+        dest: /tmp
+      register: out_put
+    - name: print output
+      debug:
+        var: out_put
+

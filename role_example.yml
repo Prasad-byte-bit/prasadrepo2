@@ -1,0 +1,16 @@
+- hosts: localhost
+  gather_facts: false
+
+  vars_prompt:
+    - name: "netapp_password"
+      prompt: "Enter the NetApp Admin Password"
+      private: true
+      confirm: true
+
+  roles:
+    - role: provision_nas
+      volname: vol3
+      protocol: nfs
+    - role: provision_nas
+      volname: vol4
+      protocol: cifs

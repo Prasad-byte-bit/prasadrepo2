@@ -1,0 +1,15 @@
+[all:vars]
+ansible_user=ansible
+ansible_ssh_pass=Netapp1!
+ansible_port=22
+
+[linux]
+ubuntu ansible_host=192.168.0.61
+awx ansible_host=192.168.0.241
+
+[control]
+ansible ansible_host=192.168.0.188
+
+[ontap]
+192.168.0.101 shortname=cluster1
+192.168.0.102 shortname=cluster2
