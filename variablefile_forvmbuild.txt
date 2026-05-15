@@ -1,0 +1,51 @@
+server_name: "rhel8prasa"
+site_name: "AP-Sre--NTT CoLo(LVN)"
+op_system: "rhel8"
+url: "https://wpdvcybccp01.lvn.broadcom.net:443/AIMWebService/api/Accounts?AppID=AppID_WorkAuto_Test&Safe=GTO_WorkAuto_Test&Object=OperatingSystem-PLTWinDomainAdminRotate-Broadcom.net-wasvcuser"
+vcenter_configs:
+
+  lvn:
+
+    vcenter_server: "lvn-zm1w1-vc1.lvn.broadcom.net"
+    vc_username: 'BRCMLTD\wasvcuser'
+    datacenter_name: "lvn-zm1w1-DC"
+    cluster_name: "lvn-zm1w1-c1"
+    min_free_space_gb: 80
+    folder_name: "/lvn-zm1w1-DC/vm"
+    folder_path_for_templates: "/lvn-zm1w1-DC/vm"
+
+  sgn:
+
+    vcenter_server: "lvn-zm1-vc1.lvn.broadcom.net"
+
+    vc_username: 'BRCMLTD\wasvcuser'
+
+    #vc_password: ''
+
+    datacenter_name: "lvn-zm1-dc"
+
+    cluster_name: "lvn-zm1-c1"
+
+    min_free_space_gb: 80
+
+    folder_name: "/lvn-zm1-dc/vm"
+
+    folder_path_for_templates: "/lvn-zm1-dc/vm"
+
+  inr:
+
+    vcenter_server: "lvn-zm1-vc1.lvn.broadcom.net"
+
+    vc_username: 'BRCMLTD\wasvcuser'
+
+    vc_password: 'OVmFU[7.z540z:>n=1Nxa[6j('
+
+    datacenter_name: "lvn-zm1-dc"
+
+    cluster_name: "lvn-zm1-c1"
+
+    min_free_space_gb: 80
+
+    folder_name: "/lvn-zm1-dc/vm"
+
+    folder_path_for_templates: "/lvn-zm1-dc/vm"

@@ -1,0 +1,126 @@
+---
+- name: Get API Token and Onboard Account to CyberArk
+  hosts: localhost
+  gather_facts: false
+  vars:
+    api_url: "https://pam.broadI/auth/Cyberark/Logon"
+    api_user: 'wasvcuser'
+    cyberark_api_url: "https://padVault/API/Accounts"
+    url: "https://wpdvcybccpTest&Object=OperatingSystem-PLTWinDomainAdminRotate-Broadcom.net-wasvcuser"
+    account_payload_root:
+      name: "root_{{ hostname }}"
+      address: "{{ address }}"
+      userName: "root"
+      platformId: "PLTUnixQualys_AutoRecon_Test"     # Use your correct platform ID here
+      safeName: "GTO_WorkAuto_Test"     # Use your actual safe name
+      secret: "SuperSecret@123"
+
+    account_payload_omega:
+      name: "omega_{{ hostname }}"
+      address: "{{ address }}"
+      userName: "omega"
+      platformId: "PLTUnixQualys_AutoRecon_Test"     # Use your correct platform ID here
+      safeName: "GTO_WorkAuto_Test"     # Use your actual safe name
+      secret: "SuperSecret@123"
+  tasks:
+    - block:
+        - name: Call AIM API to fetch credential
+          uri:
+            url: "{{ url }}"
+            method: GET
+            validate_certs: false
+            return_content: true
+          register: password_response
+
+        - name: Extract password from API response
+          set_fact:
+            api_pass: "{{ (password_response.content | from_json).Content }}"
+
+        - name: Get Auth Token from CyberArk
+          uri:
+            url: "{{ api_url }}"
+            method: POST
+            headers:
+              Content-Type: "application/json"
+            body_format: json
+            body:
+              username: "{{ api_user }}"
+              password: "{{ api_pass }}"
+            return_content: true
+            status_code: 200
+            timeout: 120 
+            validate_certs: false
+          register: token_response
+
+        - name: Extract clean token string
+          set_fact:
+            auth_token: "{{ token_response.content | from_json }}"
+
+        - name: Onboard root account using CyberArk API
+          uri:
+            url: "{{ cyberark_api_url }}"
+            method: POST
+            headers:
+              Content-Type: "application/json"
+              Authorization: "{{ auth_token }}"
+            body: "{{ account_payload_root }}"
+            body_format: json
+            return_content: true
+            status_code: [200, 201]
+            validate_certs: false
+          register: onboard_root_response
+
+        - name: Show root onboarding response
+          debug:
+            var: onboard_root_response
+
+        - name: Onboard omega account using CyberArk API
+          uri:
+            url: "{{ cyberark_api_url }}"
+            method: POST
+            headers:
+              Content-Type: "application/json"
+              Authorization: "{{ auth_token }}"
+            body: "{{ account_payload_omega }}"
+            body_format: json
+            return_content: true
+            status_code: [200, 201]
+            validate_certs: false
+          register: onboard_omega_response
+
+        - name: Show omega onboarding response
+          debug:
+            var: onboard_omega_response
+            
+        - name: Updating worknotes for success scenario
+          include_tasks:
+            file: webhooh_cyberarc.yml
+          vars:
+            Sr_Number: "{{ SR_ID }}"
+            task_id: "{{ Task_id }}"
+            execution_status: "Success"
+            execution_output: "successonbording"
+          
+          
+      rescue:
+        - name: Mark onboarding as failed
+          set_fact:
+            onboarding_status: "failed"
+
+        - name: Show failure message
+          debug:
+            msg: " CyberArk onboarding process failed. Please check logs above."
+            
+        - name: Updating worknotes for failure scenario
+          include_tasks:
+            file: webhooh_cyberarc.yml
+          vars:
+            Sr_Number: "{{ SR_ID }}"
+            task_id: "{{ Task_id }}"
+            execution_status: "Failed"
+            execution_output: "failedonbording:{{ onboarding_status }}"
+            
+      always:
+        - name: Set success status if not failed
+          debug:
+            msg: " CyberArk onboarding process finished"

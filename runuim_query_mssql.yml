@@ -1,0 +1,81 @@
+---
+- name: Run Python MSSQL script and parse results
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    ansible_connection: local
+    ansible_python_interpreter: '{{ ansible_playbook_python }}'
+
+  tasks:
+    - name: Install Python Packages in Runtime
+      ansible.builtin.pip:
+        name:
+          - pymssql==2.2.8
+
+    - name: Run Python script to fetch MSSQL cs_ids
+      ansible.builtin.shell: "python3 query_mssql_cs_id.py"
+      environment:
+        vm_name: "{{ vm_name }}"
+      register: result
+      changed_when: false
+
+    - name: Parse JSON output
+      ansible.builtin.set_fact:
+        result_data: "{{ result.stdout | from_json }}"
+
+    - name: Fail if script returned an error
+      ansible.builtin.fail:
+        msg: "Python script failed: {{ result_data.message }}"
+      when: result_data.status == 'error'
+
+    - name: Display all cs_id values
+      ansible.builtin.debug:
+        msg: "cs_id: {{ item }}"
+      loop: "{{ result_data.cs_ids }}"
+
+
+    - name: Updating worknotes for failure scenario
+      include_tasks:
+        file: webhook_uim.yml
+      vars:
+        Sr_Number: "{{ SR_ID }}"
+        Task_id: "{{ Task_id }}"
+        execution_status: "Failed"
+        execution_output: "{{ result_data }}"
+        execution_output: "Failedgetuimserverdetails{{ result }}"
+      when: result_data.status == 'error'
+
+    - name: Updating worknotes for Success scenario
+      include_tasks:
+        file: webhook_uim.yml
+      vars:
+        Sr_Number: "{{ SR_ID }}"
+        Task_id: "{{ Task_id }}"
+        execution_status: "Success"
+        execution_output: "{{ result_data }}"
+        execution_output: "Fetchinguimserverdeatilssuccess{{ result }}"
+      when: result_data.status == 'success'
+
+
+    - name: Send test email
+      ansible.builtin.mail:
+        host: relay.smtp.broadcom.com   # SMTP server
+        port: 25                     # adjust if different
+        to: siddareddygari-sp.prasad@broadcom.com
+        from: siddareddygari-sp.prasad@broadcom.com
+        subject: "SERVER BUILD UPDATE"
+        body: |
+          Hi Team,
+
+          The automation has successfully completed all server build steps.
+    
+          Please validate from your end and proceed with the next steps.
+
+          Thanks&Regards,
+          Automation Team
+      when: result_data.status == 'success'
+
+
+
+      

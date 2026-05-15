@@ -1,0 +1,56 @@
+---
+- name: Connect to remote MySQL and run query
+  hosts:  localhost
+  gather_facts: false
+
+  vars_files:
+    - vars/system_config.yml
+
+  vars:
+    script_status: "success"
+
+  tasks:
+    - name: Run MySQL query with error handling
+      block:
+
+        - name: Run SQL query on MySQL
+          community.mysql.mysql_query:
+            login_host: "{{ db_host }}"
+            login_user: "{{ db_user }}"
+            login_password: "{{ db_password }}"
+            login_db: "{{ db_name }}"
+            # login_port: "{{ db_port }}"  # Optional
+            query: "SELECT * FROM backup_status WHERE hostname='{{vm_name}}';"
+          register: query_result
+
+        - name: Show query result
+          debug:
+            var: query_result.query_result
+
+        - name: Print success message
+          debug:
+            msg: " MySQL query executed successfully."
+
+      rescue:
+        - name: Set script status to failure
+          set_fact:
+            script_status: "failed"
+
+        - name: Print failure message
+          debug:
+            msg: "Failed to execute MySQL query. Check credentials or host connectivity."
+
+      always:
+        - name: MySQL query block completed
+          debug:
+            msg: " MySQL task block finished (success or failure)."
+
+    - name: Print final script status
+      debug:
+        msg: >-
+          {{
+            " Script executed successfully."
+            if script_status == "success"
+            else " Script failed. Reason: MySQL query execution failed. Please verify DB host, credentials, or network."
+          }}
+

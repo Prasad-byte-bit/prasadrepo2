@@ -1,0 +1,385 @@
+- block:
+    - name: Call AIM API to fetch credential
+      uri:
+        url: "{{ url }}"
+        method: GET
+        validate_certs: false
+        return_content: true
+      register: password_response
+
+    - name: Extract password from API response
+      set_fact:
+        vc_passwordd: "{{ (password_response.content | from_json).Content }}"
+
+    - name: Show extracted password
+      debug:
+        msg: "Fetched password: {{ vc_passwordd }}"
+
+    - name: Extract site key from site name
+      set_fact:
+        site_key: "{{ site_name | lower | regex_search('lvn|sha|sgn|inr|png|ash|ibn|acc|ams|tky') | default('') }}"
+
+    - name: Fail if site_key is empty or invalid
+      fail:
+        msg: "Invalid site key in site name: {{ site_name }}"
+      when: site_key == ""
+
+    - name: Set vCenter config for selected site
+      set_fact:
+        vcenter_config: "{{ vcenter_configs[site_key] }}"
+
+    - name: Set vCenter individual variables
+      set_fact:
+        vcenter_server: "{{ vcenter_name }}"
+        vc_username: 'BRCMLTD\wasvcuser'
+        vc_password: "{{ vc_passwordd }}"
+        datacenter_name: "{{ datacenter_name }}"
+        cluster_name: "{{ cluster_name }}"
+        min_free_space_gb: "{{ vcenter_config.min_free_space_gb }}"
+        folder_name: "/{{ datacenter_name }}/vm"
+        folder_path: "Templates/OVF & OVA Templates"
+        content_library_name: "Hosting_Template"
+        subfolder_path: "Templates/OVF & OVA Templates"
+        library_name: "Hosting_Template"
+        library_path: "Templates/OVF & OVA Templates"
+        portgroup: "{{ PortGroup }}"
+        #portgroup: "APP-EXTERNAL_VLAN_761_INTDMZ"
+        memory_vm: "{{ memory }}"
+        cpu_vm: "{{ cpu }}"
+        subnet: "{{ subnet }}"
+        search_keyword: "OVF"  
+    - name: Debug vCenter details
+      debug:
+        msg: "Connecting to {{ vcenter_server }} as {{ vc_username }}"
+ #################################################################3    
+    - name: Login to vCenter REST API
+      uri:
+        url: "https://{{ vcenter_server }}/rest/com/vmware/cis/session"
+        method: POST
+        user: "{{ vc_username }}"
+        password: "{{ vc_password }}"
+        force_basic_auth: yes
+        validate_certs: no
+      register: login
+
+
+    - name: Get all content libraries
+      uri:
+        url: "https://{{ vcenter_server }}/rest/com/vmware/content/library"
+        method: GET
+        headers:
+          vmware-api-session-id: "{{ login.json.value }}"
+        validate_certs: no
+      register: libraries
+    
+    - name: Get details of each content library
+      uri:
+        url: "https://{{ vcenter_server }}/rest/com/vmware/content/library/id:{{ item }}"
+        method: GET
+        headers:
+          vmware-api-session-id: "{{ login.json.value }}"
+        validate_certs: no
+      loop: "{{ libraries.json.value }}"
+      register: library_details
+      
+
+    - name: Set Hosting_Template library ID
+      set_fact:
+        library_id: >-
+          {{
+            (library_details.results
+             | map(attribute='json.value')
+             | selectattr('name', 'equalto', library_name)
+             | map(attribute='id')
+             | first)
+          }}
+    
+    - name: Fail if content library not found
+      fail:
+        msg: "Content library '{{ content_library_name }}' not found in vCenter"
+      when: library_id is not defined
+    
+    - name: Get all items in the Hosting_Template library
+      uri:
+        url: "https://{{ vcenter_server }}/rest/com/vmware/content/library/item?library_id={{ library_id }}"
+        method: GET
+        headers:
+          vmware-api-session-id: "{{ login.json.value }}"
+        validate_certs: no
+      register: library_items
+#################################################################
+    - name: Get details of each item (template)
+      uri:
+        url: "https://{{ vcenter_server }}/rest/com/vmware/content/library/item/id:{{ item }}"
+        method: GET
+        headers:
+          vmware-api-session-id: "{{ login.json.value }}"
+        validate_certs: no
+      loop: "{{ library_items.json.value }}"
+      register: item_details
+      when: library_items.json.value | length > 0
+
+    - name: Store template names into vm_templates
+      set_fact:
+        vm_templates: >-
+          {{ item_details.results
+             | map(attribute='json.value.name')
+             | list }}
+      when: library_items.json.value | length > 0
+   
+    - name: Display all template names
+      debug:
+        var: vm_templates
+      when: vm_templates is defined and vm_templates | length > 0
+
+    - name: Normalize OS name for matching (ignore everything after '.')
+      set_fact:
+        os_name_normalized: >-
+          {{ op_system.split('.')[0] | lower | replace(' ', '') }}
+   
+    # Match template based on OS and version
+    - name: Find matching templates
+      set_fact:
+        matched_templates_list: "{{ matched_templates_list | default([]) + [item] }}"
+      loop: "{{ vm_templates }}"
+      when: os_name_normalized in item | lower
+   
+    # Fail if no template matches
+    #- name: Fail if no template matches
+      #fail:
+        #msg: "No template found matching OS '{{ op_system }}'"
+      #when: matched_templates_list | length == 0
+   
+    #  Pick the first matched template
+    - name: Set first matched template name
+      set_fact:
+        matched_template_name: "{{ matched_templates_list[0] }}"
+        #matched_template_name: "LNPVROCKY8X_DELETE_ON_31JAN2026"
+   
+    - name: Display matched template
+      debug:
+        msg: "Matched template for {{ op_system }} is: {{ matched_template_name }}"
+
+     
+    #- name: Gather datastore information
+      #vmware_datastore_info:
+        #hostname: "{{ vcenter_server }}"
+        #username: "{{ vc_username }}"
+        #password: "{{ vc_passwordd }}"
+        #validate_certs: no
+        #datacenter: "{{ datacenter_name }}"
+      #register: ds_info
+      
+    - name: Gather datastore information ONLY from specific cluster
+      vmware_datastore_info:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_passwordd }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        cluster: "{{ cluster_name }}"
+      register: ds_info
+
+    - name: Show all datastore details
+      debug:
+        msg: "Datastore: {{ item.name }}, Free: {{ (item.freeSpace / 1073741824) | round(2) }} GB"
+      loop: "{{ ds_info.datastores }}"
+
+    - name: Filter Pure datastores with enough free space
+      set_fact:
+        pure_datastores: >-
+          {{
+            ds_info.datastores
+            | selectattr('accessible', 'equalto', true)
+            | selectattr('name', 'search', 'Pure')
+            | selectattr('freeSpace', '>', min_free_space_gb | int * 1024 * 1024 * 1024)
+            | list
+          }}
+
+    - name: Check if eligible Pure datastore exists
+      set_fact:
+        eligible_datastores: "{{ pure_datastores }}"
+      when: pure_datastores | length > 0
+
+    #- name: Filter vSAN datastores with enough free space (only if no Pure eligible)
+      #set_fact:
+        #vsan_datastores: >-
+          #{{
+            #ds_info.datastores
+            #| selectattr('accessible', 'equalto', true)
+            #| selectattr('name', 'search', 'vSAN')
+            #| selectattr('freeSpace', '>', min_free_space_gb | int * 1024 * 1024 * 1024)
+            #| list
+          #}}
+      #when: pure_datastores | length == 0
+
+
+    - name: Filter vSAN datastores with enough free space (only if no Pure eligible)
+      set_fact:
+        vsan_datastores: >-
+          {{
+            ds_info.datastores
+            | selectattr('accessible', 'equalto', true)
+            | selectattr('name', 'search', '(?i)vsan')
+            | selectattr(
+                'freeSpace',
+                '>',
+                min_free_space_gb | int * 1024 * 1024 * 1024
+              )
+            | list
+          }}
+      when: pure_datastores | length == 0
+
+
+    - name: Set eligible_datastores from vSAN if no Pure available
+      set_fact:
+        eligible_datastores: "{{ vsan_datastores }}"
+      when: pure_datastores | length == 0 and vsan_datastores | length > 0
+
+    - name: Fail if no eligible datastore found in Pure or vSAN
+      fail:
+        msg: "No eligible datastore found in Pure or vSAN with more than {{ min_free_space_gb }} GB free."
+      when: eligible_datastores is not defined or eligible_datastores | length == 0
+
+    - name: Select the first eligible datastore
+      set_fact:
+        selected_datastore: "{{ eligible_datastores[0].name }}"
+        #selected_datastore: "acc-hm1w1-c2-Pure08"
+
+    - name: Show selected datastore
+      debug:
+        msg: "Selected datastore: {{ selected_datastore }}"
+
+    - name: Run PowerShell VM deployment script
+      command:
+        argv:
+          - pwsh
+          - -NoProfile
+          - -NonInteractive
+          - -File
+          - /var/lib/awx/projects/Automation/buildpowershell/deploy_vm_from_cl.ps1
+          - -vCenter
+          - "{{ vcenter_server }}"
+          - -VCPass
+          - "{{ vc_passwordd }}"
+          - -ContentLibrary
+          - "{{ content_library_name }}"
+          - -TemplateName
+          - "{{ matched_template_name }}"
+          - -VMName
+          - "{{ servershortname }}"
+          - -DatacenterName
+          - "{{ datacenter_name }}"
+          - -datastore
+          - "{{ selected_datastore }}"
+          - -ClusterName
+          - "{{ cluster_name }}"
+          - -NetworkName
+          - "{{ portgroup }}"
+          - -CpuCount
+          - "{{ cpu_vm }}"
+          - -MemoryGB
+          - "{{ memory_vm }}"
+      register: vm_deploy
+
+
+    - name: Debug PowerShell stdout
+      debug:
+        var: vm_deploy.stdout
+        
+    
+    #- name: Clone VM from template
+      #vmware.vmware.deploy_content_library_template:
+      #vmware_guest:
+        #hostname: "{{ vcenter_server }}"
+        #username: "{{ vc_username }}"
+        #password: "{{ vc_passwordd }}"
+        #validate_certs: no
+        #datacenter: "{{ datacenter_name }}"
+        #cluster: "{{ cluster_name }}"
+        #folder: "{{ folder_name }}"
+        #name: "{{ servershortname }}"
+        #template: "{{ matched_template_name }}"
+        #state: present
+        #datastore: "{{ selected_datastore }}"
+        #datastore: acc-hm1w1-c1-Pure05
+        #networks:
+          #- name: "{{ portgroup }}"
+            #type: static
+        #hardware:
+          #memory_mb: "{{ memory_vm | int * 1024 }}"
+          #num_cpus: "{{ cpu_vm }}"
+        #wait_for_ip_address: no     
+      #register: vm_info_creation
+      #delegate_to: localhost
+
+    #- name: Debug PowerShell stdout
+      #debug:
+        #var: vm_info_creation.stdout
+    
+    - name: Power on VM
+      vmware_guest:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_passwordd }}"
+        datacenter: "{{ datacenter_name }}"
+        validate_certs: no
+        name: "{{ servershortname }}"
+        folder: "{{ folder_name }}"
+        state: poweredon
+      delegate_to: localhost
+      
+    - name: Get VM info
+      vmware_guest_facts:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_passwordd }}"
+        datacenter: "{{ datacenter_name }}"
+        validate_certs: no
+        name: "{{ servershortname }}"
+        folder: "{{ folder_name }}"
+      register: vm_info
+
+    - name: Set power state fact
+      set_fact:
+        current_power_state: "{{ vm_info.instance.view.runtime.powerState | default('unknown') }}"
+
+
+    - name: Set success reason
+      set_fact:
+        output: "Script completed successfully!"
+
+    - name: Updating worknotes for success scenario
+      include_tasks:
+        file: vmbuild_webhook.yml
+      vars:
+        Sr_Number: "{{ SR_ID }}"
+        #task_id: "{{ Task_id }}"
+        subnet: "{{ subnet }}"
+        execution_status: "Success"
+        execution_output: "CreatingSuccess: VM {{ server_name }} deployed successfully"
+   
+  rescue:
+    - name: Display failure message with reason
+      debug:
+        msg: |
+          Script failed due to an error above.
+          Reason: {{ ansible_failed_result.msg | default('Unknown error occurred.') }}
+    - name: Set failure reason
+      set_fact:
+        Reason: "{{ ansible_failed_result.msg | default('Unknown error occurred.') }}"
+
+    - name: Updating worknotes for failure scenario
+      include_tasks:
+        file: vmbuild_webhook.yml
+      vars:
+        Sr_Number: "{{ SR_ID }}"
+        #task_id: "{{ Task_id }}"
+        subnet: "{{ subnet }}"
+        execution_status: "Failed"
+        execution_output: "CreatingFailed:{{ Reason }}"
+
+  always:
+    - name: End of script
+      debug:
+        msg: "Script execution reached the end."

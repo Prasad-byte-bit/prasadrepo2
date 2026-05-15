@@ -1,0 +1,35 @@
+---
+- name: Run SELECT query and display all cs_id values
+  hosts: localhost
+  gather_facts: false
+  vars_files:
+    - vars/system_config.yml
+
+  tasks:
+    - name: Run SQL query on MSSQL
+      community.general.mssql_script:
+        login_host: "{{ mssql_server }}"
+        login_port: "{{ mssql_port }}"
+        login_user: "{{ mssql_user }}"
+        login_password: "{{ mssql_password }}"
+        db: "{{ mssql_database }}"
+        script: "SELECT cs_id FROM SSRV2Device WHERE name LIKE 'lnpv%';"
+      register: query_result
+      failed_when: query_result.failed or query_result.query_results is not defined or query_result.query_results[0][0] is not defined
+      ignore_errors: yes
+
+    - name: Display all cs_id values returned by the query
+      debug:
+        msg: "cs_id: {{ item[0] }}"
+      loop: "{{ query_result.query_results[0] }}"
+      when: query_result is defined and query_result.query_results is defined and query_result.query_results[0] is defined
+      ignore_errors: yes
+
+    - name: Show final status message
+      debug:
+        msg: >
+          {% if query_result is defined and query_result.failed %}
+            Script failed: {{ query_result.msg | default('Unknown error occurred') }}
+          {% else %}
+            Script executed successfully.
+          {% endif %}

@@ -1,0 +1,110 @@
+---
+- name: Run Python script to configure VM via vCenter
+  hosts: localhost
+  gather_facts: false
+  vars:
+    url: "https://wpdvcybccp01.lvn.broadcom.net:443/AIMWebService/api/Accounts?AppID=AppID_WorkAuto_Test&Safe=GTO_WorkAuto_Test&Object=OperatingSystem-PLTWinDomainAdminRotate-Broadcom.net-wasvcuser"
+    site_input: "{{ site_name }}" 
+    vcenter_map:
+        lvn: "lvn-zm1w1-vc1.lvn.broadcom.net"
+        sgn: "sgn-hm1w2-vc1.sgn.broadcom.net"
+        scc: "vc-scc.mydomain.local"
+        ibn: "vc-ibn.mydomain.local"
+        inr: "vc-inr.mydomain.local"
+        png: "vc-png.mydomain.local"
+        ash: "vc-ash.mydomain.local"
+        sha: "vc-sha.mydomain.local"
+  tasks:
+    - name: Normalize input to lowercase
+      set_fact:
+        site_lc: "{{ site_input | lower() | trim() }}"
+
+    #- name: Match site code in a case-insensitive way
+      #set_fact:
+        #selected_vcenter: "{{ vcenter_map[item] }}"
+      #loop: "{{ vcenter_map.keys() | list }}"
+      #when:
+        #- site_lc is defined
+        #- (site_lc.find(item | lower) != -1)
+        #- (selected_vcenter is not defined)
+      #run_once: true
+
+    #- name: Fail if no matching vCenter found
+      #fail:
+        #msg: "No vCenter found for the given site name '{{ site_input }}'"
+      #when: selected_vcenter is not defined
+      #run_once: true
+
+    - name: Show selected vCenter
+      debug:
+        msg:
+          - "site_input: {{ site_input }}"
+          - "normalized: {{ site_lc }}"
+          #- "selected_vcenter: {{ selected_vcenter }}"
+          - "selected_vcenter: {{ vcenter_name }}"
+    - name: Ensure Python 3 and pip are installed
+      package:
+        name:
+          - python3
+          - python3-pip
+        state: present
+    - name: Call AIM API to fetch credential
+      uri:
+        url: "{{ url }}"
+        method: GET
+        validate_certs: false
+        return_content: true
+      register: password_response
+
+    - name: Extract password from API response
+      set_fact:
+        passwordd: "{{ (password_response.content | from_json).Content }}"
+        
+    - name: print password 
+      debug:
+        var: passwordd
+        
+    - name: Run VM configuration script
+      ansible.builtin.command: python3 vmconfigure_new.py
+      environment:
+        vm_name: "{{ vmshortname }}"
+        ip: "{{ ip }}"
+        subnet: "{{ subnet }}"
+        gateway: "{{ gateway }}"
+        #dns: "{{ dns }}"
+        guest_user: "{{ guest_user }}"
+        guest_password: "{{ Password }}"
+        vcenter: "{{ vcenter_name }}"
+        password: "{{ passwordd }}"
+       
+      args: 
+        chdir: "{{ playbook_dir }}"
+      register: script_out
+    - name: print output
+      debug:
+        var: script_out
+        
+    - name: Set fail_reason if script failed
+      set_fact:
+        fail_reason: "{{ script_out.stderr | default('Unknown error') }}"
+      when: script_out.rc != 0
+      
+    - name: Updating worknotes for failure scenario
+      include_tasks:
+        file: IPaddressadding_webhook.yml
+      vars:
+        Sr_Number: "{{ SR_ID }}"
+        task_id: "{{ Task_id }}"
+        execution_status: "Failed"
+        execution_output: "AddingipaddressFailed:{{ fail_reason }}"
+      when: script_out.rc != 0
+
+    - name: Updating worknotes for success scenario
+      include_tasks:
+        file: IPaddressadding_webhook.yml
+      vars:
+        Sr_Number: "{{ SR_ID }}"
+        task_id: "{{ Task_id }}"
+        execution_status: "Success"
+        execution_output: "AddingipaddressSuccess:{{ script_out.stdout_lines }}"
+      when: script_out.rc == 0

@@ -1,0 +1,205 @@
+---
+- name: Trigger VLAN Python Script on Linux
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    python_path: "/usr/bin/python3"   # Adjust to your Python path
+    script_path: "new_vlan_script.py"
+    script_pathh: "cluster_utilization.py"
+    # Adjust path
+    url: "https://wpdvcyb
+    # MULTI-VCENTER MAPPING
+    vcenter_map:
+      lvn:
+        - "lvn-zadcom.net"
+        - "lvn-hmom.net"
+        - "lvn-zm1om.net"
+      sgn:
+        - "sgn-hm1wadcom.net"
+        - "sgn-hmoadcom.net"
+      ams:
+        - "ams-hmom.net"
+      acc:
+        - "acc-hmdcom.net"
+      ibn:
+        - "ibn-hmm.net"
+      tky:
+        - "tky-h-adcom.net"
+      sha:
+        - "sha-h-adcom.net"
+      png:
+        - "png-h-adcom.net"
+
+  tasks:
+  
+      ######################################################################
+      # 1. Extract site code
+      ######################################################################
+      - name: Normalize site name
+        set_fact:
+          site_lc: "{{ site_input | lower() }}"
+  
+      - name: Extract site code using regex
+        set_fact:
+          site_code: "{{ site_lc | regex_search('(lvn|sgn|ibn|ams|acc|tky)') }}"
+  
+      - name: Fail if no valid site code found
+        fail:
+          msg: "Invalid site name '{{ site_input }}'"
+        when: site_code is not defined or site_code == ""
+  
+      ######################################################################
+      # 2. Pick VCENTER LIST
+      ######################################################################
+      - name: Set vCenter list for this site
+        set_fact:
+          vcenter_list: "{{ vcenter_map[site_code] }}"
+  
+      - name: Debug vCenters
+        debug:
+          msg: "Checking vCenters: {{ vcenter_list }}"
+  
+      ######################################################################
+      # 3. Fetch Password from API
+      ######################################################################
+      - name: Call AIM API to fetch credential
+        uri:
+          url: "{{ url }}"
+          method: GET
+          validate_certs: false
+          return_content: true
+        register: password_response
+  
+      - name: Extract password from API response
+        set_fact:
+          password: "{{ (password_response.content | from_json).Content }}"
+  
+      ######################################################################
+      # 4. Init variables
+      ######################################################################
+      - name: Initialize final results
+        set_fact:
+          vlan_found: false
+          vCenter: "N/A"
+          datacenter: "N/A"
+          cluster: "N/A"
+          portgroup: "N/A"
+  
+      ######################################################################
+      # 5. Loop over vCenters (direct loop on task)
+      ######################################################################
+      - name: Check VLAN on each vCenter
+        ansible.builtin.command: "{{ python_path }} {{ script_path }}"
+        environment:
+          password: "{{ password }}"
+          vcenter: "{{ item }}"
+          TARGET_VLAN: "{{ VLAN }}"
+          #TARGET_VLAN: "sgn-hm1w2-c2-vds-01-pg-vsan"
+        register: vlan_output_item
+        ignore_errors: yes
+        loop: "{{ vcenter_list }}"
+        loop_control:
+          label: "{{ item }}"
+        when: not vlan_found
+      
+      - name: Debug raw results per vCenter
+        debug:
+          var: vlan_output_item.results
+      
+      # Extract dictionary line from all vCenters
+      - name: Find VLAN dictionary line
+        set_fact:
+          vlan_dict_line: >-
+            {{ vlan_output_item.results
+               | map(attribute='stdout_lines')
+               | flatten
+               | select('search', '^\{\(')
+               | list
+               | first
+               | default('', true) }}
+        when: vlan_output_item.results is defined
+      
+      - name: Debug extracted VLAN dict line
+        debug:
+          msg: "Matched line: {{ vlan_dict_line }}"
+        when: vlan_dict_line != ""
+      
+      - name: Convert VLAN dict line to string
+        set_fact:
+          vlan_dict_line_str: "{{ vlan_dict_line | string }}"
+      
+      - name: Extract VLAN fields safely
+        set_fact:
+          vCenter: "{{ (vlan_dict_line_str | regex_search(\"'vCenter': '([^']+)'\", '\\1')) | default('N/A', true) }}"
+          datacenter: "{{ (vlan_dict_line_str | regex_search(\"'Datacenter': '([^']+)'\", '\\1')) | default('N/A', true) }}"
+          cluster: "{{ (vlan_dict_line_str | regex_search(\"'Cluster': '([^']+)'\", '\\1')) | default('N/A', true) }}"
+          portgroup: "{{ (vlan_dict_line_str | regex_search(\"'PortGroup': '([^']+)'\", '\\1')) | default('N/A', true) }}"
+          vlan_found: "{{ datacenter != 'N/A' }}"
+        when: vlan_dict_line_str != ""
+
+      - name: Normalize cluster to string
+        set_fact:
+          cluster_str: "{{ cluster | first }}"
+        when: cluster is iterable and cluster is not string
+      - name: Normalize cluster to string
+        set_fact:
+          vCenter_str: "{{ vCenter | first }}"
+        when: cluster is iterable and cluster is not string
+
+
+      - name: Check cpu and memory
+        ansible.builtin.command: "{{ python_path }} {{ script_pathh }}"
+        environment:
+          password: "{{ password }}"
+          vcenter: "{{ vCenter_str }}"
+          TARGET_VLAN: "{{ VLAN }}"
+          cluster_name: "{{ cluster_str }}"
+        register: cluster_util_output
+        ignore_errors: yes
+     
+      - name: Parse JSON output
+        set_fact:
+          cluster_util: "{{ cluster_util_output.stdout | from_json }}"
+      
+      - name: Show cluster utilization
+        debug:
+          msg:
+            - "Cluster={{ cluster_util.cluster }}"
+            - "CPU Used/GHz={{ cluster_util.cpu_used_ghz }}"
+            - "Memory Used/GB={{ cluster_util.mem_used_gb }}"  
+      
+      
+          
+      - name: Show final extracted VLAN info
+        debug:
+          msg:
+            - "vCenter: {{ vCenter }}"
+            - "Datacenter: {{ datacenter }}"
+            - "Cluster: {{ cluster }}"
+            - "PortGroup: {{ portgroup }}"
+            - "CPU Used/GHz={{ cluster_util.cpu_used_ghz }}"
+            - "Memory Used/GB={{ cluster_util.mem_used_gb }}"
+  
+      ######################################################################
+      # 6. Update Worknotes
+      ######################################################################
+      - name: Updating worknotes for success
+        include_tasks: webhook_for_vlan.yml
+        vars:
+          Sr_Number: "{{ SR_ID }}"
+          subnet: "{{ subnet }}"
+          execution_status: "{{ 'success' if vlan_found else 'failure' }}"
+          execution_output:
+            - "vCenter: {{ vCenter }}"
+            - "Datacenter: {{ datacenter }}"
+            - "Cluster: {{ cluster }}"
+            - "PortGroup: {{ portgroup }}"
+            - "CPU Used/GHz={{ cluster_util.cpu_used_ghz }}"
+            - "Memory Used/GB={{ cluster_util.mem_used_gb }}"
+        #when: vlan_found
+  
+      #- name: VLAN not found on any vCenter
+        #debug:
+          #msg: "VLAN {{ VLAN }} not found on ANY vCenter in site {{ site_code }}"
+        #when: not vlan_found

@@ -1,0 +1,21 @@
+
+---
+- set_fact:
+    #workato_webhook_url: "https://webhooks.workato.com/webhooks/rest/0da217e1-6908-420d-a646-fb2782dcc318/selfheal-update-wolken-serverbuild"
+    workato_webhook_url: "https://webhooks.workato.com/webhooks/rest/0da217e1-6908-420d-a646-fb2782dcc318/backupscript"
+- name: Update Worknotes
+  uri:
+    url: "{{ workato_webhook_url }}"
+    method: POST
+    headers:
+      Content-Type: "application/json"
+    body_format: json
+    body:
+      SR: "{{ Sr_Number }}"
+      Task_id: "{{ task_id }}"
+      script_execution_status: "{{ execution_status }}"
+      script_execution_output: "{{ execution_output }}"
+  delegate_to: localhost
+  #no_log: true  # Uncomment this to hide sensitive output in logs (optional but recommended)
+  vars:
+    ansible_connection: local

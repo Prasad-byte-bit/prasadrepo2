@@ -1,0 +1,183 @@
+- block:
+
+    - name: Call AIM API to fetch credential
+      uri:
+        url: "{{ url }}"
+        method: GET
+        validate_certs: false
+        return_content: true
+      register: password_response
+
+    - name: Extract password from API response
+      set_fact:
+        #vc_passwordd: "{{ password_response.content | regex_search('\"Content\":\"([^\"]+)\"', '\\1') }}"
+        vc_passwordd: "{{ (password_response.content | from_json).Content }}"
+    - name: Show extracted password
+      debug:
+        msg: "Fetched password: {{ vc_passwordd }}"
+
+
+
+
+
+    - name: Extract site key from server name
+      set_fact:
+        site_key: "{{ site_name | lower | regex_search('lvn|sha|sgn|inr|png|ash|ibn') | default('') }}"
+
+    - name: Fail if site_key is empty or invalid
+      fail:
+        msg: "Invalid site key in site name: {{ site_name }}"
+      when: site_key == ""
+
+    - name: Set vCenter config for selected site
+      set_fact:
+        vcenter_config: "{{ vcenter_configs[site_key] }}"
+
+    - name: Set vCenter individual variables
+      set_fact:
+        vcenter_server: "{{ vcenter_config.vcenter_server }}"
+        vc_username: "{{ vcenter_config.vc_username }}"
+        vc_password: "{{ vc_passwordd }}"
+        datacenter_name: "{{ vcenter_config.datacenter_name }}"
+        cluster_name: "{{ vcenter_config.cluster_name }}"
+        min_free_space_gb: "{{ vcenter_config.min_free_space_gb }}"
+        folder_name: "{{ vcenter_config.folder_name }}"
+        folder_path_for_templates: "{{ vcenter_config.folder_path_for_templates }}"
+
+    - name: Debug vCenter details
+      debug:
+        msg: "Connecting to {{ vcenter_server }} as {{ vc_username }}"
+
+    # Get VM Templates
+    - name: Get all templates
+      community.vmware.vmware_vm_info:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_password }}"
+        validate_certs: no
+        folder: "{{ folder_path_for_templates }}"
+        vm_type: template
+      register: vm_templates
+
+    - name: Match templates by name
+      set_fact:
+        matched_templates: "{{ matched_templates | default([]) + [item.guest_name] }}"
+      loop: "{{ vm_templates.virtual_machines }}"
+      when: op_system in item.guest_name
+
+    - name: Fail if no template matches
+      fail:
+        msg: "No template found matching '{{ op_system }}'"
+      when: matched_templates is not defined or matched_templates | length == 0
+
+    - name: Set matched template
+      set_fact:
+        matched_template_name: "{{ matched_templates[0] }}"
+
+    - name: Debug matched template
+      debug:
+        msg: "Matched template: {{ matched_template_name }}"
+
+    # Get Datastores
+    - name: Get datastores
+      community.vmware.vmware_datastore_info:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+      register: ds_info
+
+    - name: Show datastore details
+      debug:
+        msg: "Datastore: {{ item.name }}, Free: {{ (item.freeSpace / 1073741824) | round(2) }} GB"
+      loop: "{{ ds_info.datastores }}"
+
+    - name: Filter eligible datastores
+      set_fact:
+        eligible_datastores: >-
+          {{
+            ds_info.datastores
+            | selectattr('accessible', 'equalto', true)
+            | selectattr('freeSpace', '>', min_free_space_gb | int * 1024 * 1024 * 1024)
+            | list
+          }}
+
+    - name: Fail if no eligible datastore
+      fail:
+        msg: "No datastore found with > {{ min_free_space_gb }} GB free space"
+      when: eligible_datastores | length == 0
+
+    - name: Select datastore
+      set_fact:
+        selected_datastore: "{{ eligible_datastores[0].name }}"
+
+    - name: Debug selected datastore
+      debug:
+        msg: "Selected datastore: {{ selected_datastore }}"
+
+    # Clone VM
+    - name: Clone VM from template
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_password }}"
+        validate_certs: no
+        datacenter: "{{ datacenter_name }}"
+        cluster: "{{ cluster_name }}"
+        folder: "{{ folder_name }}"
+        name: "{{ server_name }}"
+        template: "{{ matched_template_name }}"
+        state: present
+        datastore: "{{ selected_datastore }}"
+        hardware:
+          memory_mb: 2048
+          num_cpus: 2
+      delegate_to: localhost
+
+    # Power On
+    - name: Get VM info
+      community.vmware.vmware_guest_info:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_password }}"
+        datacenter: "{{ datacenter_name }}"
+        validate_certs: no
+        name: "{{ server_name }}"
+        folder: "{{ folder_name }}"
+      register: vm_info
+
+    - name: Set power state fact
+      set_fact:
+        current_power_state: "{{ vm_info.instance.view.runtime.powerState | default('unknown') }}"
+
+    - name: Power on VM
+      community.vmware.vmware_guest_powerstate:
+        hostname: "{{ vcenter_server }}"
+        username: "{{ vc_username }}"
+        password: "{{ vc_password }}"
+        datacenter: "{{ datacenter_name }}"
+        validate_certs: no
+        name: "{{ server_name }}"
+        folder: "{{ folder_name }}"
+        state: powered-on
+      when: current_power_state != 'poweredOn'
+      delegate_to: localhost
+
+    - name: Script completed successfully
+      debug:
+        msg: " Script completed successfully!"
+
+  rescue:
+
+    - name: Display failure message with reason
+      debug:
+        msg: |
+          Script failed due to an error above.
+          Reason: {{ ansible_failed_result.msg | default('Unknown error occurred.') }}
+
+  always:
+
+    - name: End of script
+      debug:
+        msg: " Script execution reached the end."

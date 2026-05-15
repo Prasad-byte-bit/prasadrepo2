@@ -1,0 +1,1667 @@
+---
+- name: Prepare dynamic host
+  hosts: localhost
+  gather_facts: no
+
+  vars:
+    ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+  
+  vars_files:
+    - vars/system_config.yml
+
+  tasks:
+    - name: Decide corporate or dmz
+      set_fact:
+        cor_dmz: "{{ 'corporate' if target_host.startswith('10') else 'dmz' }}"
+
+    - debug:
+        var: cor_dmz
+
+    # ---------------------------------------------------
+    #  Prod / Nonprod
+    # ---------------------------------------------------
+    - name: Decide prod or nonprod
+      set_fact:
+        prod_nonprod: "{{ 'nonprod' if vm_name.startswith('lnpv') else 'prod' }}"
+
+    - debug:
+        var: prod_nonprod
+
+    # ---------------------------------------------------
+    #  Subname detection
+    # ---------------------------------------------------
+    - name: Identify subname
+      set_fact:
+        subname: >-
+          {{
+            ['acc','sgn','lvn','erp','ibn','tky','ams','png','sha']
+            | select('in', vm_name | lower)
+            | list
+            | first
+          }}
+
+    - debug:
+        var: subname
+
+    # ---------------------------------------------------
+    #  Read host.ini
+    # ---------------------------------------------------
+    - name: Read host.ini using full path
+      set_fact:
+        host_lines: "{{ lookup('file', '/var/lib/awx/projects/myprojecrserverbuild/rpmfiles/host.ini').splitlines() }}"
+
+    # ---------------------------------------------------
+    #  Select hostname (ALL RULES)
+    # ---------------------------------------------------
+    - name: Select final hostname
+      set_fact:
+        hostname_fact: >-
+          {{
+            (
+              host_lines
+              | select('search', '^' ~ subname)
+              | select('search',
+                  ('c' if cor_dmz == 'corporate' else 'd') ~
+                  ('prod' if prod_nonprod == 'prod' else 'nprd')
+                )
+              | list
+              | first
+            )
+            if subname in ['acc','sgn'] else
+            (
+              host_lines
+              | select('search', '^lvn')
+              | select('search',
+                  'cprod' if cor_dmz == 'corporate' else
+                  ('dprod' if prod_nonprod == 'prod' else 'dnprd')
+                )
+              | list
+              | first
+            )
+            if subname == 'lvn' else
+            (
+              host_lines
+              | select('search', '^' ~ subname)
+              | list
+              | first
+            )
+          }}
+
+    - name: Select final hostname
+      set_fact:
+        hostname_fac: "{{ hostname_fact | default('') }}"
+
+
+
+
+    # ---------------------------------------------------
+    #  Safety check (recommended)
+    # ---------------------------------------------------
+    - name: Fail if hostname not resolved
+      fail:
+        msg: >
+          No hostname matched.
+          vm_name={{ vm_name }},
+          cor_dmz={{ cor_dmz }},
+          prod_nonprod={{ prod_nonprod }}
+      when: hostname_fact is not defined or hostname_fact | length == 0
+    - name: Add target host dynamically
+      add_host:
+    
+        name: "{{ target_host }}"
+        groups: "dynhosts"
+        ansible_user: "autoadmin"
+        ansible_ssh_pass: "{{ Password }}"
+  
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"
+        script_success: true
+        error_message: ""
+        ansible_host: "{{ target_host }}"
+        hostname: "{{ vm_name }}"
+        server_name: "{{ vm_name }}"
+        test_email: "{{ test_email }}"
+        telnet_host: "{{ vm_name }}"
+        servername: "{{ vm_name }}"
+        hostname_fact: "{{ hostname_fac }}"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null"
+
+
+
+- name: Connect to Linux server dynamically
+  hosts: dynhosts
+  gather_facts: yes
+  become: yes
+  #become_user: root
+
+  vars_files:
+    - vars/system_config.yml
+
+  tasks:
+    
+    - block:
+        - name: Initialize script_failed flag
+          set_fact:
+            script_failed: false
+        ######################################
+        #         ORIGINAL SCRIPT            #
+        ######################################
+
+        - name: Validate OS type
+          set_fact:
+            os_distro: "{{ ansible_distribution | lower }}"
+        - fail:
+            msg: "Unsupported OS: {{ ansible_distribution }}"
+          when: os_distro not in ['redhat', 'oraclelinux', 'rocky']
+        ###############################################
+        #          CHANGES IN HOSTS AND HOSTNAME FILE #
+        ###############################################
+        - name: Reset /etc/hosts with default localhost entries
+          copy:
+            dest: /etc/hosts
+            content: |
+              127.0.0.1   localhost localhost.localdomain localhost4 localhost4.localdomain4
+              ::1         localhost localhost.localdomain localhost6 localhost6.localdomain6
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Add entry to /etc/hosts (IP FQDN SHORTNAME)
+          lineinfile:
+            path: /etc/hosts
+            line: "{{ target_host }} {{ vm_name }} {{ vm_name.split('.')[0] }}"
+            state: present
+        - name: Set FQDN in /etc/server_name
+          lineinfile:
+            path: /etc/hostname
+            line: "{{ vm_name }}"
+            state: present
+
+        ######################################
+        #          CHECKING network-manager  #
+        ######################################
+        - name: Check & Install NetworkManager
+          block:
+            - name: Check NetworkManager (RedHat)
+              command: rpm -q NetworkManager
+              register: nm_check
+              ignore_errors: yes
+
+        - name: Enable & start NetworkManager
+          systemd:
+            name: NetworkManager
+            state: started
+            enabled: yes
+          register: task_out
+
+        - name: Print file status
+          debug:
+            msg: "File exists: {{ task_out }}"
+
+        ######################################
+        #          CHECKING vmtools_check    #
+        ######################################
+        - name: Install open-vm-tools if needed
+          block:
+            - command: rpm -q open-vm-tools
+              register: vmtools_check
+              ignore_errors: yes
+              changed_when: false
+
+            - systemd:
+                name: vmtoolsd
+                enabled: yes
+                state: started
+              register: task_output
+              
+            - name: Print file status
+              debug:
+                msg: "File exists: {{ task_output }}"
+
+        ######################################
+        #          kdump_check               #
+        ######################################
+        - name: Install kexec-tools if needed
+          block:
+            - command: rpm -q kexec-tools
+              register: kdump_check
+              ignore_errors: yes
+              changed_when: false
+
+            - systemd:
+                name: kdump
+                enabled: yes
+                state: started
+              register: outputt
+
+            - name: Print file status
+              debug:
+                msg: "File exists: {{ outputt }}"
+
+        ######################################
+        #         Sendmail CONFIGARATION     #
+        ######################################
+        - name: Sendmail setup
+          block:
+            - name: Check if Sendmail is installed
+              shell: rpm -q sendmail
+              register: sendmail_check
+              ignore_errors: yes
+              changed_when: false
+
+            - name: Check if Postfix is installed
+              shell: rpm -q postfix
+              register: postfix_check
+              ignore_errors: yes
+              changed_when: false
+
+            - name: Determine if packages need to be installed
+              set_fact:
+                install_packages: "{{ (sendmail_check.rc != 0) and (postfix_check.rc != 0) }}"
+
+            - name: Install required packages if not present
+              yum:
+                name:
+                  - sendmail
+                  - sendmail-cf
+                  - m4
+                  - mailx
+                state: present
+              when: install_packages
+
+            - name: Backup existing sendmail.mc and sendmail.cf
+              copy:
+                src: "/etc/mail/{{ item }}"
+                dest: "/etc/mail/{{ item }}.bakk1"
+                remote_src: yes
+              with_items:
+                - sendmail.mc
+                - sendmail.cf
+              ignore_errors: yes
+
+            - name: Overwrite sendmail.mc with full static configuration
+              copy:
+                dest: /etc/mail/sendmail.mc
+                content: |
+                  define(`_USE_ETC_MAIL_')dnl
+                  dnl #
+                  include(`/usr/share/sendmail-cf/m4/cf.m4')dnl
+                  dnl #
+                  OSTYPE(`linux')dnl
+                  dnl #
+                  dnl # Defines
+                  dnl #
+                  dnl #
+                  dnl # Macros
+                  dnl #
+                  DAEMON_OPTIONS(`Name=MTA-v4, Family=inet, Port=smtp')dnl
+                  DAEMON_OPTIONS(`Name=MTA-v6, Family=inet6, Port=smtp, M=O')dnl
+                  dnl #
+                  FEATURE(nocanonify)
+                  dnl # Mailer
+                  dnl #
+                  MAILER(`smtp')dnl
+                  MAILER(`local')dnl
+                  define(`SMART_HOST', `relay.smtp.broadcom.com')dnl
+                  define(`confMAX_DAEMON_CHILDREN', `500')dnl
+                  define(`confPRIVACY_FLAGS', `authwarnings,novrfy,noexpn,restrictqrun')dnl
+                owner: root
+                group: root
+                mode: '0644'
+
+            - name: Rebuild sendmail.cf from sendmail.mc
+              shell: m4 /etc/mail/sendmail.mc > /etc/mail/sendmail.cf
+
+            - name: Restart sendmail service
+              service:
+                name: sendmail
+                state: restarted
+                enabled: true
+
+            - name: Install mailx
+              yum:
+                name: mailx
+                state: present
+              ignore_errors: yes
+            
+            - name: Restart sendmail service
+              service:
+                name: sendmail
+                state: restarted
+                enabled: true
+              ignore_errors: yes
+            
+            - name: Send test mail to validate configuration
+              shell: |
+                echo "Testmail from {{ server_name }}" | mailx -s "Sendmail Config Test" "{{ test_email }}"
+              register: mail_status
+              ignore_errors: yes
+
+
+            #- name: Send test mail to validate configuration
+              #shell: echo "Testmail from {{ server_name }}" | mailx -s "Sendmail Config Test" "{{ test_email }}"
+              #ignore_errors: yes
+   
+        ######################################
+        #          SNOWAGENT                 #
+        ######################################
+        - name: RPM/DEB download and verification
+          block:
+
+            - name: Copy RPM from local controller to remote server
+              become: yes
+              copy:
+                src: /var/lib/awx/projects/myprojecrserverbuild/rpmfiles/Linux_2_8_2024-snowagent-7.0.0-x64.rpm
+                dest: /var/tmp/Linux_2_8_2024-snowagent-7.0.0-x64.rpm
+                mode: '0644'
+              when: ansible_facts['distribution'] != "Ubuntu"
+              
+            - name: Copy RPM from local controller to remote server
+              become: yes
+              copy:
+                src: /var/lib/awx/projects/myprojecrserverbuild/rpmfiles/Linux_2_8_2024-snowagent-7.0.0-x64.deb
+                dest: /var/tmp/Linux_2_8_2024-snowagent-7.0.0-x64.rpm
+                mode: '0644'
+              when: ansible_facts['distribution'] == "Ubuntu"
+    
+            - name: Capture installed snowagent RPM (RHEL)
+              ansible.builtin.shell: rpm -qa | grep snowagent
+              register: snowrpm
+              ignore_errors: true
+              when: ansible_facts['distribution'] != "Ubuntu"
+    
+            - name: Capture installed snowagent DEB (Ubuntu)
+              ansible.builtin.shell: dpkg -l | grep snowagent
+              register: snowrpm1
+              ignore_errors: true
+              when: ansible_facts['distribution'] == "Ubuntu"
+    
+            - name: Show current SnowAgent version (RHEL)
+              debug:
+                var: snowrpm.stdout_lines
+              when: snowrpm is succeeded
+    
+            - name: Show current SnowAgent version (Ubuntu)
+              debug:
+                var: snowrpm1.stdout_lines
+              when: snowrpm1 is succeeded
+    
+    
+            - name: Remove snowagent if present(Rhel)
+              yum:
+                name: snowagent
+                state: absent
+              when:
+                - ansible_facts['distribution'] != "Ubuntu"
+                - snowrpm is succeeded
+    
+    
+            - name: Remove snowagent if present(ubantu)
+              yum:
+                name: snowagent
+                state: absent
+              when:
+                - ansible_facts['distribution'] == "Ubuntu"
+                - snowrpm is succeeded
+    
+            - name: Install new SnowAgent RPM
+              become: yes
+              dnf:
+                name: /var/tmp/Linux_2_8_2024-snowagent-7.0.0-x64.rpm
+                state: present
+                disable_gpg_check: true
+              when:
+                - ansible_facts['distribution'] != "Ubuntu"
+    
+            - name: Install new SnowAgent DEB
+              become: yes
+              dnf:
+                name: /var/tmp/Linux_2_8_2024-snowagent-7.0.0-x64.deb
+                state: present
+                disable_gpg_check: true
+              when:
+                - ansible_facts['distribution'] == "Ubuntu"
+    
+              
+            - name: Telnet test (port {{ telnet_port }} on {{ telnet_host }})
+              shell: "timeout 5 bash -c '</dev/tcp/{{ telnet_host }}/{{ telnet_port }}' && echo 'Telnet success' || echo 'Telnet failed'"
+              register: telnet_result
+              changed_when: false
+    
+            - name: SSL connectivity test (port {{ telnet_port }} on {{ telnet_host }})
+              shell: "echo | openssl s_client -connect {{ telnet_host }}:{{ telnet_port }} -servername {{ telnet_host }} 2>/dev/null | grep -i 'connected' || echo 'SSL failed'"
+              register: ssl_result
+              changed_when: false
+              
+            - name: Run SnowAgent scan
+              ansible.builtin.shell: /opt/snow/snowagent scan
+    
+    
+            - name: Re-check installed snowagent RPM
+              ansible.builtin.shell: rpm -qa | grep snowagent
+              register: snowrpm
+              ignore_errors: true
+              when: ansible_facts['distribution'] != "Ubuntu"
+    
+            - name: Re-check installed snowagent DEB
+              ansible.builtin.shell: dpkg -l | grep snowagent
+              register: snowrpm1
+              ignore_errors: true
+              when: ansible_facts['distribution'] == "Ubuntu"
+    
+            - name: Show final SnowAgent version (RHEL)
+              debug:
+                var: snowrpm.stdout_lines
+              when: snowrpm is succeeded
+    
+            - name: Show final SnowAgent version (Ubuntu)
+              debug:
+                var: snowrpm1.stdout_lines
+              when: snowrpm1 is succeeded
+          
+
+        ######################################
+        #        SEP/DCS INSTALLATION        #
+        ######################################
+        - name: SEP/DCS
+          block:
+            - name: Copying the installer for os-8
+              copy: src="{{ installer_path }}/SEP_14.3RU8_EnterpriseServers_Linux_OnlineInstaller" dest=/root/SEP_14.3RU8_EnterpriseServers_Linux_OnlineInstaller mode=0655 owner=root group=root
+              when:
+                - ansible_distribution_major_version == "8"
+              #delegate_to: localhost
+              ignore_errors: true
+                      
+            - name: Copying the installer for os-9
+              copy: src="{{ installer_path }}/SEP_14.3RU9_EnterpriseServers_Linux_OnlineInstaller" dest=/root/SEP_14.3RU9_EnterpriseServers_Linux_OnlineInstaller mode=0655 owner=root group=root
+              when:
+                - ansible_distribution_major_version == "9"
+              #delegate_to: localhost
+              ignore_errors: true
+        
+            - name: installing sep for os-8
+              shell: /root/SEP_14.3RU8_EnterpriseServers_Linux_OnlineInstaller
+              when:
+                - ansible_distribution_major_version == "8"
+              register: instout8
+        
+            - name: installing sep for os-9
+              shell: /root/SEP_14.3RU9_EnterpriseServers_Linux_OnlineInstaller
+              when:
+                - ansible_distribution_major_version == "9"
+              register: instout9
+              ignore_errors: true
+        
+            - name: creating DCS config dir
+              shell: mkdir -p /opt/DCS_Agent_Installer
+        
+        
+            - name: Copying the agnet binary for os-8
+              copy: src="{{ installer_path }}/agent64-linux-rhel8-9537.bin" dest=/opt/DCS_Agent_Installer mode=0655
+              when:
+                - ansible_distribution_major_version == "8"
+              delegate_to: localhost
+              ignore_errors: true
+                
+            - name: Copying the agent certificate for os-8
+              copy: src="{{ installer_path }}/agent-cert.ssl" dest=/opt/DCS_Agent_Installer mode=0640
+              when:
+                - ansible_distribution_major_version == "8"
+              delegate_to: localhost
+              ignore_errors: true
+        
+            - name: Copying the agnet binary for os-9
+              copy: src="{{ installer_path }}/agent64-linux-rhel9-9537.bin" dest=/opt/DCS_Agent_Installer mode=0655
+              when:
+                - ansible_distribution_major_version == "9"
+              delegate_to: localhost
+              ignore_errors: true
+              
+                
+            - name: Copying the agent certificate for os-9
+              copy: src="{{ installer_path }}/agent-cert.ssl" dest=/opt/DCS_Agent_Installer mode=0640
+              when:
+                - ansible_distribution_major_version == "9"
+              delegate_to: localhost
+              ignore_errors: true
+                
+            - name: insatlling symentic DCS for os-8
+              shell: "{{ install_dir }}/agent64-linux-rhel8-9537.bin -server=10.97.216.137 -secGrp=BRCM_Enterprise_Unix -cert=/opt/DCS_Agent_Installer/agent-cert.ssl -disableIps -silent"
+              when:
+                - ansible_distribution_major_version == "8"
+              ignore_errors: True
+        
+            - name: insatlling symentic DCS for os-9
+              shell: "{{ install_dir }}/agent64-linux-rhel9-9537.bin -server=10.97.216.137 -secGrp=BRCM_Enterprise_Unix -cert=/opt/DCS_Agent_Installer/agent-cert.ssl -disableIps -silent"
+              when:
+                - ansible_distribution_major_version == "9"
+              ignore_errors: True
+        
+        
+            - name: cheking symentic service status 
+              shell: /usr/lib/symantec/status.sh
+              ignore_errors: True
+              
+              
+            - name: Changing config for sdcssagent using sisipsconfig.sh
+              shell: su - sisips -c '/opt/Symantec/sdcssagent/IPS/sisipsconfig.sh -h 10.97.216.137,10.97.216.136'
+              ignore_errors: True
+          
+            - name: restart service to take it effect
+              shell: /etc/init.d/sisipsagent restart
+              ignore_errors: True
+          
+            - name: Capture output for command1
+              shell: su - sisips -c '/opt/Symantec/sdcssagent/IPS/sisipsconfig.sh -v' |grep "Server Host List"
+              register: command1
+              ignore_errors: True
+          
+            - name: Capture output for command2
+              shell: su - sisips -c '/opt/Symantec/sdcssagent/IPS/sisipsconfig.sh -v' |grep "Current Management Server"
+              register: command2
+              ignore_errors: True
+          
+            - name: display command1
+              debug:
+                msg: "{{ command1.stdout }}"
+          
+            - name: display command2
+              debug:
+                msg: "{{ command2.stdout }}"
+          
+            - name: setfact for command1
+              set_fact:
+                fact_command1: "{{ command1.stdout }}"
+        
+        
+            - name: setfact for command2
+              set_fact:
+                fact_command2: "{{ command2.stdout }}"
+
+        ######################################
+        #          NSCD INSTALLATION         #
+        ######################################
+
+        - name: NSCD configuration block
+          block:
+
+            - name: Install nscd package
+              yum:
+                name: "{{ nscd_package }}"
+                state: present
+
+            - name: Backup nscd.conf
+              copy:
+                src: "{{ nscd_conf_path }}"
+                dest: "{{ nscd_conf_backup }}"
+                remote_src: yes
+
+            - name: Replace 'yes' with 'no'
+              replace:
+                path: "{{ nscd_conf_path }}"
+                regexp: 'yes'
+                replace: 'no'
+
+            - name: Replace 'no' with 'yes' on hosts line
+              replace:
+                path: "{{ nscd_conf_path }}"
+                regexp: '^(hosts.*)no'
+                replace: '\1yes'
+
+            - name: Enable and start nscd service
+              systemd:
+                name: "{{ nscd_service }}"
+                enabled: yes
+                state: started
+
+            - name: Backup nsswitch.conf
+              copy:
+                src: "{{ nsswitch_conf_path }}"
+                dest: "{{ nsswitch_conf_backup }}"
+                remote_src: yes
+
+            - name: Update hosts line in nsswitch.conf
+              lineinfile:
+                path: "{{ nsswitch_conf_path }}"
+                regexp: '^hosts:.*cache'
+                line: "{{ nsswitch_hosts_line }}"
+
+            - name: Run nscd -g and capture output
+              command: nscd -g
+              register: nscd_g_output
+              changed_when: false
+
+            - name: Extract cache hit rate
+              set_fact:
+                hosts_hit_rate: "{{ (nscd_g_output.stdout | regex_search('hosts:\\s*([0-9]+)%', '\\1') | int) }}"
+              when: nscd_g_output.stdout is defined
+
+            - name: Show NSCD cache hit rate and status
+              debug:
+                msg: >-
+                  NSCD hosts cache hit rate: {{ hosts_hit_rate | default('unknown') }}% |
+                  {% if (hosts_hit_rate | int) > 1 %}
+                    Cache is running
+                  {% else %}
+                    Cache is not running
+                  {% endif %}
+        ######################################
+        #   QUALYS CLOUD AGENT INSTALLATION  #
+        ######################################
+        - name: Install and activate Qualys Cloud Agent
+          block:
+
+            - name: Copy QualysCloudAgent_Latest.rpm to target host
+              copy:
+                src: "/var/lib/awx/projects/myprojecrserverbuild/rpmfiles/QualysCloudAgent_Latest.rpm"
+                dest: "/root/QualysCloudAgent_Latest.rpm"
+                mode: '0644'
+              register: copy_result
+        
+              
+            - name: Check if QualysCloudAgent_Latest.rpm already exists on target
+              stat:
+                path: "/root/QualysCloudAgent_Latest.rpm"
+              register: rpm_file_stat
+            
+            - name: Copy QualysCloudAgent_Latest.rpm to target host if not exists
+              copy:
+                src: "/var/lib/awx/projects/myprojecrserverbuild/rpmfiles/QualysCloudAgent_Latest.rpm"
+                dest: "/root/QualysCloudAgent_Latest.rpm"
+                mode: '0644'
+              when: not rpm_file_stat.stat.exists
+              register: copy_result
+
+            - name: Install Qualys Cloud Agent RPM
+              shell: rpm -ivh "/root/QualysCloudAgent_Latest.rpm"
+              register: install_output
+              failed_when: "'error' in (install_output.stderr | default('')).lower()"
+
+            - name: Show installation output
+              debug:
+                var: install_output.stdout_lines
+
+            - name: Run Qualys agent activation script
+              shell: >
+                {{ qualys_bin_path }}
+                ActivationId={{ activation_id }}
+                CustomerId={{ customer_id }}
+              register: activation_output
+              failed_when: "'error' in (activation_output.stderr | default('')).lower()"
+
+            - name: Show activation output
+              debug:
+                var: activation_output.stdout_lines
+
+            - name: Check Qualys agent service status
+              shell: systemctl status qualys-cloud-agent
+              register: service_status
+              failed_when: "'Active: active (running)' not in (service_status.stdout | default(''))"
+
+            - name: Show service status output
+              debug:
+                var: service_status.stdout_lines
+            ######################################
+            #   NIMSOFT                          #
+            ######################################
+
+            - name: get domain name
+              shell: /bin/echo "{{ vm_name }}" |/usr/bin/awk '{split($0, array, "."); print array[2]}'
+              register: dnsname
+          
+            - name: Set facts
+              set_fact:
+                dnsname_fact:  "{{ dnsname.stdout }}"
+          
+            - name: display domain name
+              debug:
+                msg: "{{ dnsname.stdout }}"
+          
+            - name: copy nimsoft rpm file
+              copy: src="{{ nimsoftpath }}/nimsoft-robot.x86_64_23_4_2.rpm" dest=/opt/nimsoft-robot.x86_64_23_4_2.rpm mode=0644
+          
+            - name: Check if the service exists
+              shell: systemctl list-units --type=service --all | grep -w {{ service_name }}
+              register: service_check
+              ignore_errors: true
+          
+            - name: Stop the service if it exists
+              service:
+                 name: "{{ service_name }}"
+                 state: stopped
+              when: service_check.rc == 0
+          
+            - name: Check if the nimsoft directory exists
+              stat:
+                path: "/opt/nimsoft/"
+              register: nimsoft_stat
+              ignore_errors: True
+          
+            # Task for remove contains of directory
+            - name: remove yum.repos.d dir contents
+              file:
+                state: absent
+                path: /opt/nimsoft/
+              when: nimsoft_stat.stat.exists
+          
+            - name: Check if the nimsoft nms config file is exists
+              stat:
+                path: "/opt/nms-robot-vars.cfg"
+              register: nimsoft_nms_stat
+              ignore_errors: True
+          
+            # Task for remove contains of directory
+            - name: remove yum.repos.d dir contents
+              file:
+                state: absent
+                path: /opt/nms-robot-vars.cfg
+              when: nimsoft_nms_stat.stat.exists
+          
+            - name: remove nimsoft old version
+              shell: rpm -e nimsoft-robot
+              ignore_errors: True
+          
+            - name: install new nimsoft rpm
+              shell: rpm -ivh /opt/nimsoft-robot.x86_64_23_4_2.rpm
+              register: inst_nimsoft
+          
+            - name: display installation
+              debug:
+                msg: "{{ inst_nimsoft.stdout }}"
+          
+            - name: Copy robot config from jinja template
+              template:
+                src: "{{ nimsoftpath }}/nimsoft-robot.j2"
+                dest: /opt/nimsoft/robot/robot.cfg
+                mode: '0600'
+          
+            - name: Copy nms config from jinja template
+              template:
+                src: "{{ nimsoftpath }}/nms-robot-vars.j2"
+                dest: /opt/nms-robot-vars.cfg
+                mode: '0640'
+          
+            - name: start the script
+              shell: sh /opt/nimsoft/install/RobotConfigurer.sh
+              register: script_out
+          
+            - name: display script out
+              debug:
+                msg: "{{ script_out.stdout }}"
+          
+          
+            - name: service reload
+              service:
+                daemon_reload: true
+          
+            - name: start nimbus service
+              service:
+                name: nimbus
+                state: started
+                enabled: true
+
+#####################################
+            - name: Check if the service exists
+              shell: systemctl list-units --type=service --all | grep -w {{ service_name }}
+              register: service_check
+              ignore_errors: true
+            
+            - name: Set service status facts
+              set_fact:
+                service_existsnim: "{{ service_check.rc == 0 }}"
+                service_activenim: >-
+                  {{ service_check.rc == 0 and service_check.stdout_lines[0].split()[2] == 'active' }}
+                service_runningnim: >-
+                  {{ service_check.rc == 0 and service_check.stdout_lines[0].split()[3] == 'running' }}
+            
+            - name: Show service status
+              debug:
+                msg:
+                  - "Service exists  : {{ service_existsnim }}"
+                  - "Service active  : {{ service_activenim }}"
+                  - "Service running : {{ service_runningnim }}"
+#############################################
+
+
+           ###############################
+           # resolv.conf                 #
+           ###############################
+            - name: get domain name
+              shell: /bin/echo "{{ vm_name }}" |/usr/bin/awk '{split($0, array, "."); print array[2]}'
+              register: dnsname
+        
+            - name: Set facts
+              set_fact:
+                dnsname_fact:  "{{ dnsname.stdout }}"
+            
+            - name: display domain name
+              debug:
+                msg: "{{ dnsname.stdout }}"
+            
+            - name: Backup resolv.conf
+              copy:
+                src: /etc/resolv.conf
+                dest: /etc/resolv.conf_bkp
+                mode: '0644'
+                remote_src: yes
+              register: copied
+            
+            - name: Configure DNS resolvers
+              template: src="{{ resolvpath }}/{{ domainpath }}" dest=/etc/resolv.conf
+              when:
+                  - copied != 6
+          ###############################
+           # ntp                 #
+           ###############################
+
+
+            - name: get domain name
+              shell: /bin/echo "{{ vm_name }}" |/usr/bin/awk '{split($0, array, "."); print array[2]}'
+              register: dnsname
+          
+            - name: Set facts
+              set_fact:
+                dnsname_fact:  "{{ dnsname.stdout }}"
+          
+            - name: Install ntp
+              yum: name=ntp state=present
+              when:
+                - ansible_distribution_major_version == "7" or ansible_distribution_major_version == "6"
+              tags: ntp
+          
+            - name: Backup ntp.conf
+              copy:
+                src: /etc/ntp.conf
+                dest: /etc/ntp.conf_bkp
+                mode: '0644'
+                remote_src: yes
+              when:
+                - ansible_distribution_major_version == "7" or ansible_distribution_major_version == "6"
+              register: ntpcopied
+              ignore_errors: True
+          
+          
+            - name: Configure ntp.conf
+              template: src="{{ ntppathh }}/{{ ntppath }}" dest=/etc/ntp.conf
+              when:
+                - ansible_distribution_major_version == "7" or ansible_distribution_major_version == "6"
+                - ntpcopied != 6
+              tags: ntp
+              notify: restart ntp
+          
+            - name: make sure ntpd service is running
+              service: name=ntpd state=started enabled=true
+              when:
+                - ansible_distribution_major_version == "7" or ansible_distribution_major_version == "6"
+              tags: ntp
+          
+            - name: Install chrony
+              yum: name=chrony state=present
+              when:
+                - ansible_distribution_major_version == "8" or ansible_distribution_major_version == "9"
+              tags: chrony
+          
+          
+            - name: Backup chrony.conf
+              copy:
+                src: /etc/chrony.conf
+                dest: /etc/chrony.conf_bkp
+                mode: '0644'
+                remote_src: yes
+              register: chronycopied
+              ignore_errors: True
+              when:
+                - ansible_distribution_major_version == "8" or ansible_distribution_major_version == "9"
+          
+          
+            - name: Configure chrony.conf
+              template: src="{{ ntppathh }}/chrony.conf.j2" dest=/etc/chrony.conf
+              when:
+                - ansible_distribution_major_version == "8" or ansible_distribution_major_version == "9"
+                - chronycopied != 6
+              tags: chrony
+              ignore_errors: True
+          
+          
+            - name: check if chronyd is running
+              service: name=chronyd state=started enabled=true
+              when:
+                - ansible_distribution_major_version == "8" or ansible_distribution_major_version == "9"
+              tags: chrony
+              ignore_errors: True
+
+            #########################
+            # loginsight             #
+            ##########################
+
+            - name: Take a backup under root
+              shell: cp /etc/liagent.ini /root/liagent.ini
+              ignore_errors: true
+          
+            - name: Take a backup liagent
+              shell: cp /var/lib/loginsight-agent/liagent.ini /var/lib/loginsight-agent/liagent.ini_{{ ansible_date_time.date }}_{{ ansible_date_time.time }}_bkp
+              ignore_errors: true
+              
+            - name: Ensure liagent.ini exists
+              file:
+                path: /var/lib/loginsight-agent
+                state: touch
+                mode: '0644'
+    
+            - name: copy config
+              copy:
+                src: /var/lib/awx/projects/myprojecrserverbuild/rpmfiles/liagent.ini
+                dest: /var/lib/loginsight-agent/
+              ignore_errors: true
+              delegate_to: localhost
+          
+            - name: File is exist
+              stat:
+                path: /root/VMware-Log-Insight-Agent-8.18.0-24019905.noarch.rpm
+              register: present
+          
+          
+            - name: Copy the file to remote system
+              copy:
+                src: /var/lib/awx/projects/myprojecrserverbuild/rpmfiles/VMware-Log-Insight-Agent-8.18.0-24019905.noarch.rpm
+                dest: /root
+                force: no
+              delegate_to: localhost
+              when: not present.stat.exists
+              
+          
+            - name: Package was already installed
+              shell:
+                cmd: rpm -q VMware-Log-Insight-Agent
+                warn: false
+              register: package_installed
+              changed_when: package_installed.rc == 1
+              ignore_errors: yes
+          
+            - name: Package installed status
+              debug:
+                msg: "{{ package_installed.stdout }}"
+          
+            - name: check the loginsight agent is preset
+              stat:
+                path: /etc/init.d/liagentd
+              register: agent_available
+          
+            - name: service stop liagentd
+              systemd:
+                name: liagentd
+                state: stopped
+                enabled: yes
+              ignore_errors: True
+          
+            - name: remove PKG
+              yum:
+                name:
+                  - VMware-Log-Insight-Agent
+                state: absent
+              ignore_errors: yes
+          
+            - name: install pkg
+              shell: rpm -ivh /root/VMware-Log-Insight-Agent-8.18.0-24019905.noarch.rpm
+              ignore_errors: yes
+            
+            - name: replace update line
+              replace:
+                path: /var/lib/loginsight-agent/liagent.ini
+                regexp: ';auto_update=yes'
+                replace: 'auto_update=yes'
+              ignore_errors: true
+          
+            - name: configure ssl cert config
+              lineinfile:
+                path: /var/lib/loginsight-agent/liagent.ini
+                line: "ssl_accept_any=yes"
+                insertafter: ";ssl_fips_mode=1"
+                state: present
+              register: sslcert
+          
+            - name: Configure the OS log sending to logininsight
+              blockinfile:
+                path: /var/lib/loginsight-agent/liagent.ini
+                backup: yes
+                block: |
+          
+                  [filelog|audit]
+                  directory=/var/log/audit
+                  include=audit.log
+                  tags={"apptag":"os-auditlogs"}
+          
+                  [filelog|messages]
+                  directory=/var/log
+                  include=messages;messages.?
+                  parser=syslog_parser
+                  tags={"apptag":"os-logs"}
+          
+                  [filelog|secure]
+                  directory=/var/log
+                  include=secure;secure.?
+                  parser=syslog_parser
+                  tags={"apptag":"os-logs"}
+          
+                  [filelog|maillog]
+                  directory=/var/log
+                  include=maillog;mail.err;mail.log;mail.log.?
+                  parser=mail_parser
+                  tags={"apptag":"os-logs"}
+          
+                  [parser|syslog_parser]
+                  base_parser=clf
+                  format=%t %i %{appname}i: %M
+                  field_decoder={"appname":"syslog_appname_parser"}
+                  exclude_fields=log_message
+          
+                  [parser|syslog_appname_parser]
+                  base_parser=clf
+                  format=%{appname}i[%{thread_id}i]
+          
+                  [parser|mail_parser]
+                  base_parser=clf
+                  format=%t %i %{appname}i[%{thread_id}i]: %M
+                  exclude_fields=log_message
+          
+                  [parser|audit_parser]
+                  base_parser=clf
+                  format=type=%{type}i msg=%{msg}i %M
+                  exclude_fields=log_message
+          
+                insertbefore: "; Uncomment the appropriate section to collect system logs"
+                marker: "; {mark} ANSIBLE MANAGED BLOCK"
+              when: sslcert != 6 
+    
+          
+          
+            - name: find the string hostname
+              lineinfile:
+                path: /var/lib/loginsight-agent/liagent.ini
+                line: "hostname={{ hostname_fact }}"
+                state: present
+              register: result
+          
+            - name: Debug the result
+              debug:
+                msg: "String exists in the file: {{ result }}"
+          
+            - name: Server name hostname=endpointname added
+              lineinfile:
+                path: /var/lib/loginsight-agent/liagent.ini
+                regexp: '^;hostname=OPERATIONS_FOR_LOGS'
+                insertafter: '; hostname=OPERATIONS_FOR_LOGS'
+                line: "hostname={{ hostname_fact }}"
+              ignore_errors: true
+          
+            - name: remove last line if hostname is present
+              shell: sed -i '${/hostname=/d}' /var/lib/loginsight-agent/liagent.ini
+              ignore_errors: true
+          
+            - name: Upload service check script
+              copy: src=/var/lib/awx/projects/myprojecrserverbuild/rpmfiles/servicechk.sh dest=/etc/servicestatuschk.sh mode=0655
+              delegate_to: localhost
+              
+          
+            - name: Get liagentd Service Status
+              shell: /etc/servicestatuschk.sh liagentd
+              ignore_errors: True
+              register: liagentd_service_status
+          
+            - name: Get endpoint Status
+              shell: cat //var/lib/loginsight-agent/liagent.ini|grep ^hostname|awk -F'=' '{print $2}' 
+              ignore_errors: True
+              register: endpoint_status
+          
+            - name: tag used in liagent
+              shell: cat //var/lib/loginsight-agent/liagent.ini|grep tag|awk -F'=' '{print $2}'|tr '\n' ','
+              ignore_errors: True
+              register: tag_status
+          
+            - name: service start liagentd
+              systemd:
+                name: liagentd
+                state: started
+                enabled: yes 
+              ignore_errors: True
+          
+            - name: display liagentd status
+              debug:
+                msg: "{{ liagentd_service_status.stdout }}"
+                                      
+          
+            - name: Send HTML email
+              mail:
+                host: "relay.smtp.broadcom.com"
+                port: 25
+                subject: "Infra-Log-Insight-Status-Report!!!"
+                body: "loginsite for server {{ vm_name }} is completed"
+             #   from: "HCL-HOSTING-LINUX-SMTP-PDL.pdl@broadcom.com"
+                from: "siddareddygari-sp.prasad@broadcom.com"
+              #  to: "hcl-unix-linux.pdl-it@broadcom.com"
+                to: "siddareddygari-sp.prasad@broadcom.com"
+              #content_type: html
+                subtype: html
+                charset: utf8
+              delegate_to: localhost
+              run_once: true
+      ##########################################
+      #post pathch and patch server 
+      ########################################
+
+            - name: copy python3-six on oracle9 VM
+              copy: src=/var/lib/awx/projects/software/python3-six-1.15.0-9.0.1.el9.noarch.rpm dest=/tmp/python3-six-1.15.0-9.0.1.el9.noarch.rpm mode=0666
+              when:
+                - (ansible_distribution == "OracleLinux")
+                - ansible_distribution_major_version == "9"
+          
+            - name: install python3-six on oracle9 VM
+              shell: rpm -ivh --replacepkgs --replacefiles /tmp/python3-six-1.15.0-9.0.1.el9.noarch.rpm
+              when:
+                - (ansible_distribution == "OracleLinux")
+                - ansible_distribution_major_version == "9"     
+          
+            - name: dnf change to limit=2
+              replace:
+                path: /etc/dnf/dnf.conf
+                regexp: '^installonly_limit=3'
+                replace: 'installonly_limit=2'
+          
+            - name: display date
+              debug:
+                msg: "{{ date }}"
+          
+          
+            - name: stop and disable rhnsd service
+              service:
+                name: "rhnsd"
+                state: stopped
+                enabled: false
+              when:
+                - ansible_distribution == "OracleLinux"
+              ignore_errors: True
+          
+          
+          
+          ## Take the month value for Quater or monthly patching
+            - name: get subscriotion-manager is installed or not
+              shell: subscription-manager version
+              register: result
+              ignore_errors: True
+          
+            - name: get domain name
+              shell: /bin/echo "{{ inventory_hostname }}" |/usr/bin/awk '{split($0, array, "."); print array[2]}'
+              register: dnsname
+          
+            - name: Display DNS name
+              debug:
+                msg: "{{ dnsname.stdout }}"
+          
+            - name: Set facts
+              set_fact:
+                dnsname_fact:  "{{ dnsname.stdout }}"
+          
+            - name: Set facts for smartproxy
+              set_fact:
+                smartproxy_fact:  "{{ smartproxy }}"
+          
+            - name: Display smartproxy
+              debug:
+                msg: "{{ smartproxy_fact }}"
+          
+          
+            - name: remove rhn_client
+              shell: yum remove rhn-client-tools -y
+              ignore_errors: True
+          
+            - name: backing up repo
+              shell: "mkdir -p /etc/yum.repos.d_bkp/;mv -fn /etc/yum.repos.d/* /etc/yum.repos.d_bkp/"
+          
+          # Task for remove contains of directory
+            - name: remove yum.repos.d dir contents
+              file:
+                path: "{{ item }}"
+                state: absent
+              with_fileglob:
+                - "/etc/yum.repos.d/"
+          
+            - name: unsbsribe repo
+              shell: subscription-manager remove --all;subscription-manager unregister; subscription-manager clean; yum remove -y katello-ca-consumer-lpdvkatello02.sgn.broadcom.net-1.0-1.noarch
+              when:
+                - ansible_distribution != "Ubuntu"
+              register: unreg
+              ignore_errors: True
+          
+            - name: remove all repos
+              shell: rm -rf /etc/yum.repos.d/*.repo
+          
+            - name: register smart proxy download cert etc-rhsm-ca
+              shell: cd /etc/yum.repos.d;curl --insecure --output katello-ca-consumer-latest.noarch.rpm https://{{ smartproxy_fact }}/pub/katello-ca-consumer-latest.noarch.rpm
+              when:
+                - ansible_distribution != "Ubuntu"
+                - unreg != 6
+                #-  result1 is failed
+              ignore_errors: True
+          
+            - name: register smart proxy install cert etc-rhsm-ca
+              shell: cd /etc/yum.repos.d;yum localinstall katello-ca-consumer-latest.noarch.rpm -y
+              when:
+                - ansible_distribution != "Ubuntu"
+                - unreg != 6
+               #-  result1 is failed
+              ignore_errors: True
+          
+            - name: subscription manager clean-repos
+              shell: subscription-manager clean
+              when:
+                - ansible_distribution != "Ubuntu"
+              ignore_errors: True
+              register: cleanrepo
+          
+            - name: wait 5
+              shell: sleep 5
+          
+            - name: subscription manager register katello client for all OS8
+              shell: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/Foreman_Client-CV8" --force
+              when:
+                - ansible_distribution != "Ubuntu"
+                - ansible_distribution_major_version == "8"
+              register: clientrepo8
+          
+            - name: subscription manager register katello client for all OS9
+              command: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/Foreman_Client-CV9" --force
+              when:
+                - ansible_distribution != "Ubuntu"
+                - ansible_distribution_major_version == "9"
+              register: clientrepo9
+          
+            - name: enable client repo
+              shell: subscription-manager repos --enable=*
+              when:
+                - ansible_distribution != "Ubuntu"
+              ignore_errors: True
+          
+            - name: install Katello client PKGs
+              yum:
+                name:
+                  - katello-host-tools-tracer
+                  - katello-host-tools
+                state: present
+              when:
+                - ansible_distribution != "Ubuntu"
+              ignore_errors: True
+              register: Katellopkg
+          
+            - name: clean repo
+              shell: subscription-manager clean
+              when:
+                - ansible_distribution != "Ubuntu"
+              ignore_errors: True
+          
+            - name: clean repo files
+              shell: rm -rf /etc/yum.repos.d/*.repo
+              when:
+                - ansible_distribution != "Ubuntu"
+              ignore_errors: True
+          
+          
+            - name: subscription manager register katello yum repo for OEL8
+              shell: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/{{ qtr }}{{ yr }}-OracleLinux8_CV" --force
+              when:
+                    - (ansible_distribution == "OracleLinux")
+                    -   ansible_distribution_major_version == "8"
+          
+            - name: subscription manager register katello yum repo for OEL9
+              shell: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/{{ qtr }}{{ yr }}-OracleLinux9_CV" --force
+              when:
+                    - (ansible_distribution == "OracleLinux")
+                    -   ansible_distribution_major_version == "9"
+          
+            - name: subscription manager register katello yum repo for RHEL8
+              shell: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/{{ qtr }}{{ yr }}-RHEL8_CV" --force
+              when:
+                    - (ansible_distribution == "RedHat")
+                    -   ansible_distribution_major_version == "8"
+          
+            - name: subscription manager register katello yum repo for RHEL9
+              shell: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/{{ qtr }}{{ yr }}-RHEL9_CV" --force
+              when:
+                    - (ansible_distribution == "RedHat")
+                    -   ansible_distribution_major_version == "9"
+          
+            - name: subscription manager register katello yum repo for Rocky8
+              shell: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/{{ qtr }}{{ yr }}-Rocky8_CV" --force
+              when:
+                    - (ansible_distribution == "Rocky")
+                    -   ansible_distribution_major_version == "8"
+          
+            - name: subscription manager register katello yum repo for Rocky9
+              shell: subscription-manager register --username "admin" --password "UA7U6Nn7P5RnpbWe" --org "Broadcom-PROD" --environments "LifeENV-PROD/{{ qtr }}{{ yr }}-Rocky9_CV" --force
+              when:
+                    - (ansible_distribution == "Rocky")
+                    -   ansible_distribution_major_version == "9"
+          
+            - name: enable client repo
+              shell: subscription-manager repos --enable=*
+              ignore_errors: True
+              register: enblerepo
+    
+          
+            - name: Verify uek
+              shell: cat /etc/sysconfig/kernel |grep DEFAULTKERNEL=|cut -d'=' -f2
+              register: uek
+            
+            - name: Set facts
+              set_fact:
+                uek_fact1:  "{{ uek.stdout }}"
+            
+            - name: Update kernel
+              yum:
+                name: 'kernel'
+                state: latest
+                update_cache: yes
+              tags: yum
+              register: kupdate
+            
+            - name: upgrade all packages
+              yum:
+                name: '*'
+                state: latest
+                update_cache: yes
+              tags: yum
+              register: yumupdate
+            
+            - name: Reboot a slow machine that might have lots of updates to apply
+              reboot:
+                reboot_timeout: 3600
+                test_command: uptime
+              when:
+                - yumupdate is changed
+    
+            - name: Get kernal version
+              shell: uname -a
+              register: kv
+              
+            - name: diplay kernal version
+              debug:
+                msg: "{{ kv.stdout }}"
+      ##########################################
+      #user sudo access removal and rebbot server
+      ########################################
+
+            - name: Set system hostname
+              ansible.builtin.hostname:
+                name: "{{ server_name }}"
+              when:
+                - ansible_distribution != "Rocky"
+
+            - name: Set hostname on Rocky Linux
+              command: hostnamectl set-hostname "{{ server_name }}"
+              when:
+                - ansible_distribution == "Rocky"
+
+
+            - name: Show sudoers.d contents BEFORE removal
+              command: ls -l /etc/sudoers.d/
+              register: sudo_dir_before
+            - name: print files
+              debug:
+                msg: "{{ sudo_dir_before.stdout_lines }}"
+        
+            - name: Remove sudo privileges from autoadmin
+              file:
+                path: "/etc/sudoers.d/autoadmin"
+                state: absent
+              register: sudo_remove
+            - name: Show sudoers.d contents BEFORE removal
+              command: ls -l /etc/sudoers.d/
+              register: sudo_dir_before
+        
+            - name: DEBUG - Print sudoers.d BEFORE
+              debug:
+                msg: "{{ sudo_dir_before.stdout_lines }}"
+        
+        
+            - name: Reboot the server
+              reboot:
+                msg: "Reboot triggered by Ansible after removing sudo access"
+                reboot_timeout: 600
+              register: reboot_status
+        
+            - name: Confirm server is back online after reboot
+              wait_for_connection:
+                timeout: 300
+        
+            - name: Verify reboot was successful by checking uptime
+              command: uptime -s
+              register: uptime_output
+        
+            - name: Show reboot verification result
+              debug:
+                msg: "Server rebooted successfully. Last boot time: {{ uptime_output.stdout }}"
+
+             
+            # 8. Final Status
+            - name: Final Status - Success
+              debug:
+                msg: "Script executed successfully."
+              when: not script_failed
+              
+            - name: Set failure flag and error message
+              set_fact:
+                success_message: "Script executed successfully."
+                
+            - name: Final Status - Failure
+              debug:
+                msg: "Script failed."
+              when: script_failed
+
+      rescue:
+        - name: Set failure flag and error message
+          set_fact:
+            script_success: false
+            error_message: "An error occurred. Check above logs for details."
+
+        - name: Updating worknotes for failure scenario
+          include_tasks:
+            file: ../../webhook_postbuild.yml
+          vars:
+            Sr_Number: "{{ SR_ID }}"
+            task_id: "{{ Task_id }}"
+            execution_status: "Failed"
+            execution_output: "DoingPostbuildstepsfailed:{{ error_message }}"
+
+      always:
+            
+        - name: Final Status Message
+          debug:
+            msg: >-
+              {% if script_success %}
+               Script completed successfully!
+              {% else %}
+               Script failed: {{ error_message }}
+              {% endif %}
+
+        - name: Define service list
+          set_fact:
+            service_list:
+              - NetworkManager
+              - vmtoolsd
+              - kdump
+              - sendmail
+              - nscd
+              - qualys-cloud-agent
+
+        - name: Get enabled status of services
+          command: "systemctl is-enabled {{ item }}"
+          register: service_enabled
+          loop: "{{ service_list }}"
+          ignore_errors: true
+
+        - name: Get active status of services
+          command: "systemctl is-active {{ item }}"
+          register: service_active
+          loop: "{{ service_list }}"
+          ignore_errors: true
+
+        - name: Read /etc/hosts
+          shell: cat /etc/hosts
+          register: hosts_content
+          changed_when: false
+
+        - name: Check uptime
+          shell: cut -d ' ' -f1 /proc/uptime
+          register: UPTIME_PRE_REBOOT
+
+        - name: setfact and display uptime 
+          set_fact:
+            uptime_days: "{{ (UPTIME_PRE_REBOOT.stdout | int / 86400) | round(0) }}"
+
+        - name: Capture status od sep
+          shell: su - sisips -c '/opt/Symantec/sdcssagent/IPS/sisipsconfig.sh -v' |grep "Server Host List"
+          register: command1
+          ignore_errors: true
+    
+        - name: Capture output for dcs
+          shell: su - sisips -c '/opt/Symantec/sdcssagent/IPS/sisipsconfig.sh -v' |grep "Current Management Server"
+          register: command2
+          ignore_errors: true
+    
+        - name: display command1
+          debug:
+            msg: "{{ command1.stdout }}"
+    
+        - name: display command2
+          debug:
+            msg: "{{ command2.stdout }}"
+    
+        - name: setfact for command1
+          set_fact:
+            fact_command1: "{{ command1.stdout }}"
+    
+    
+        - name: setfact for command2
+          set_fact:
+            fact_command2: "{{ command2.stdout }}"
+  
+
+        - name: Gather system info facts
+          set_fact:
+            summary_info:
+              hostname: "{{  ansible_fqdn | default(ansible_hostname) }}"
+              ip: "{{ ansible_default_ipv4.address | default('N/A') }}"
+              os: "{{ ansible_distribution }} {{ ansible_distribution_version }}"
+              kernel: "{{ ansible_kernel }}"
+              datetime: "{{ ansible_date_time.iso8601 }}"
+              cpus: "{{ ansible_processor_cores }}"
+              physical_cpus: "{{ ansible_processor_count }}"
+              memory_gb: "{{ lookup('pipe', \"free -h | awk '/^Mem:/ {print $2}'\") }}"
+              etc_hosts: "{{ hosts_content.stdout.split('\n') | last }}"
+              liagent: "{{ liagentd_service_status.stdout }}"
+              nproc: "{{ lookup('pipe', 'nproc') | int }}"
+              Symentic: "{{ fact_command1 }}"
+              DCS: "{{ fact_command2 }}"
+              uptime: "{{ uptime_days }}"
+              nimbus_status: "{{ service_runningnim }}"
+
+        - name: Create readable summary file on remote
+          copy:
+            dest: /tmp/system_summary.csv
+            mode: '0644'
+            content: |
+              TASK,STATUS
+              Set IP,{{ summary_info.ip }}
+              Hostname,{{ summary_info.hostname }}
+              CPU Cores,{{ summary_info.nproc }}
+              Memory,{{ summary_info.memory_gb }}
+              OS,{{ summary_info.os }}
+              Kernel,{{ summary_info.kernel }}
+              DateTime,{{ summary_info.datetime }}
+              Uptime,{{ summary_info.uptime }}
+              Hosts,"{{ summary_info.etc_hosts }}"
+              Liagent,{{ summary_info.liagent }}
+              Symantec,{{ summary_info.Symentic }}
+              DCS,{{ summary_info.DCS }}
+              Nimbus,{{ summary_info.nimbus_status }}
+        
+              {% for svc, en, ac in service_list
+                   | zip(service_enabled.results, service_active.results) %}
+              {{ svc }},{{ en.stdout | default('unknown') }} ({{ ac.stdout | default('unknown') }})
+              {% endfor %}
+        
+              CE Name Hosting,unix
+              Cryptographic Settings,COM
+
+
+        - name: Fetch system summary CSV to local machine
+          fetch:
+            src: /tmp/system_summary.csv
+            #dest: /home/workatansi/prasad/
+            dest: /var/lib/awx/projects/myprojecrserverbuild/reportsserverbuild/
+            flat: yes
+
+        #- name: Send system summary with attachment (remote host)
+          #shell: |
+            #echo "System summary report for {{ server_name }} attached." | \
+            #mailx -s "System Summary Report - {{ server_name }}" \
+            #-a /tmp/system_summary.csv "{{ test_email }}"
+          #ignore_errors: yes
+
+
+        - name: Send Server build Report email
+          mail:
+            host: "relay.smtp.broadcom.com"
+            port: 25
+            subject: "server_build_report"
+            body: |
+              Hi Team,
+    
+              Please find the server build report for the server {{ server_name }}.
+             
+    
+              Regards,
+              Automation Team
+            from: "siddareddygari-sp.prasad@broadcom.com"
+            #to: "siddareddygari-sp.prasad@broadcom.com"
+            to:
+              - "siddareddygari-sp.prasad@broadcom.com"
+              #- "binayabhusan.mohapatra@broadcom.com"
+
+            subtype: plain
+            charset: utf8
+            attach:
+              - "/var/lib/awx/projects/myprojecrserverbuild/reportsserverbuild/system_summary.csv"
+          delegate_to: localhost
+          run_once: true
+
+
+
+        - name: Print Final Summary to Console
+          debug:
+            msg: |
+              =========  SYSTEM SUMMARY =========
+              Hostname       : {{ summary_info.hostname }}
+              IP Address     : {{ summary_info.ip }}
+              OS Name        : {{ summary_info.os }}
+              Kernel Version : {{ summary_info.kernel }}
+              Date & Time    : {{ summary_info.datetime }}
+              CPU Cores      : {{ summary_info.cpus }} ({{ summary_info.physical_cpus }} physical)
+              Total Memory   : {{ summary_info.memory_gb }} GB
+
+              =========  /etc/hosts =========
+              {{ hosts_content.stdout }}
+
+              ========= 🔧 SERVICE STATUSES =========
+              {% for i in range(service_list | length) %}
+              {{ service_list[i] }} => Enabled: {{ service_enabled.results[i].stdout | default('unknown') }},
+              Active: {{ service_active.results[i].stdout | default('unknown') }}
+              {% endfor %}
+              
+        - name: Update webhook for success
+          include_tasks:
+            file: ../../webhook_postbuild.yml
+          when: script_success
+          vars:
+            Sr_Number: "{{ SR_ID }}"
+            task_id: "{{ Task_id }}"
+            execution_status: "Success"
+            execution_output: "Script executed successfully."

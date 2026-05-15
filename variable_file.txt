@@ -1,0 +1,106 @@
+system_config.yml
+[workatansi@lnpvansi01 vars]$ cat system_config.yml
+# vars/system_config.yml
+
+ip_address: "10.175.168.139"
+hostname: "lnpvrhel9auto.lvn.broadcom.net"
+test_email: "siddareddygari-sp.prasad@broadcom.com"
+server_name: "lnpvrhel9auto.lvn.broadcom.net"
+
+#snowagent
+centos_rpm_url: "http://lnpvspacewalk08.sgn.broadcom.net/Linux_2_8_2024-snowagent-7.0.0-x64.rpm"
+centos_rpm_file: "Linux_2_8_2024-snowagent-7.0.0-x64.rpm"
+
+ubuntu_deb_url: "http://lnpvspacewalk08.sgn.broadcom.net/Linux_2_8_2024-snowagent-7.0.0-x64.deb"
+ubuntu_deb_file: "Linux_2_8_2024-snowagent-7.0.0-x64.deb"
+
+telnet_host: "lnpvrhel9auto.lvn.broadcom.net"
+telnet_port: 443
+
+
+
+#sepdcs
+
+installer_url: http://lnpvspacewalk08.sgn.broadcom.net/SEP_14.3RU9_EnterpriseServers_Linux_OnlineInstaller
+installer_filename: SEP_14.3RU8_EnterpriseServers_Linux_OnlineInstaller
+installer_path: "/tmp/{{ installer_filename }}"
+install_dir: /opt/DCS_Agent_Installer
+local_agent_path: /opt/DCS_Agent_Installer
+remote_agent_path: /opt/DCS_Agent_Installer
+agent_bin: agent64-linux-rhel9.bin
+agent_cert: agent-cert.ssl
+dcs_server: 135.36.13.15
+dcs_sec_group: BRCM_Enterprise_Unix
+
+
+
+#nscd.............
+nscd_package: nscd
+nscd_service: nscd
+nscd_conf_path: /etc/nscd.conf
+nscd_conf_backup: "/etc/nscd.conf-bkp_{{ ansible_date_time.month }}-{{ ansible_date_time.day }}-{{ ansible_date_time.year }}"
+nsswitch_conf_path: /etc/nsswitch.conf
+nsswitch_conf_backup: "/etc/nsswitch.conf-bkp_{{ ansible_date_time.month }}-{{ ansible_date_time.day }}-{{ ansible_date_time.year }}"
+nsswitch_hosts_line: "hosts: cache files dns myhostnameprasad"
+
+
+#qualys...............
+# vars/qualys_vars.yml
+
+rpm_src_path: /root/QualysCloudAgent_Latest.rpm
+rpm_dest_path: /root/QualysCloudAgent_Latest.rpm
+qualys_bin_path: /usr/local/qualys/cloud-agent/bin/qualys-cloud-agent.sh
+activation_id: 5f3b7a71-91d9-4580-a0e8-b1d3b75286a1
+customer_id: f9a43117-1883-eea4-8247-42f9dfa52825
+
+
+#nimsofttt
+
+robot_cfg_path: /opt/nimsoft/robot/robot.cfg
+nms_vars_cfg_path: /opt/nms-robot-vars.cfg
+nimsoft_rpm_src: /root/nimsoft-robot.x86_64.rpm
+nimsoft_rpm_dest: /root/nimsoft-robot.x86_64.rpm
+servername: lnpvrhel9auto.lvn.broadcom.net
+
+
+#root and omega creation
+
+users:
+  - name: prasad
+    password: "prasad@123"
+  - name: prasadreddy
+    password: "prasadreddy@123"
+
+remote_csv_file: /tmp/user_credentials.csv
+remote_json_file: /tmp/user_credentials.json
+local_cred_dir: /home/workatansi/prasad/postbuildsteps
+
+#cyberarc onbording
+# vars/cyberark_vars.yml
+api_url: "https://pam.broadcom.net/PasswordVault/API/auth/Cyberark/Logon"
+api_user: "wasvcuser"
+api_pass: ",b0kKJrshDOhEvoe/,|>CnQ:*"
+
+cyberark_api_url: "https://pam.broadcom.net/PasswordVault/API/Accounts"
+
+account_address: "192.168.1.10"   # Update as needed
+platform_id: "PLTUnixQualys_AutoRecon_Test"
+safe_name: "GTO_WorkAuto_Test"
+
+csv_path: /home/workatansi/prasad/postbuildsteps/user_credentials.csv
+
+
+#backup............
+db_name: cohesity
+db_user: cohesity_rusr
+db_password: C0hesity_rusr
+db_host: db-prd-ace02.broadcom.net
+vm_name: LPDVFOIT01.acc.broadcom.net
+
+
+#UIM...................
+mssql_server: wnpvuimdb01.lvn.broadcom.net
+mssql_port: 1433
+mssql_user: dxtoolsqladmin
+mssql_password: ZGR5MnA3!5
+mssql_database: CA_UIM20

@@ -1,0 +1,655 @@
+---
+- name: Full System Setup with Unified Error Handling
+  hosts: myservers
+  become: yes
+  gather_facts: yes
+
+  vars_files:
+    - vars/system_config.yml
+
+  vars:
+    script_success: true
+    error_message: ""
+
+  tasks:
+
+    - block:
+
+        ######################################
+        #         ORIGINAL SCRIPT            #
+        ######################################
+
+        - name: Validate OS type
+          set_fact:
+            os_distro: "{{ ansible_distribution | lower }}"
+        - fail:
+            msg: "Unsupported OS: {{ ansible_distribution }}"
+          when: os_distro not in ['redhat', 'oraclelinux', 'rocky']
+        ###############################################
+        #          CHANGES IN HOSTS AND HOSTNAME FILE #
+        ###############################################
+        - name: Add entry to /etc/hosts (IP FQDN SHORTNAME)
+          lineinfile:
+            path: /etc/hosts
+            line: "{{ ip_address }} {{ hostname }} {{ hostname.split('.')[0] }}"
+            state: present
+        - name: Set FQDN in /etc/hostname
+          lineinfile:
+            path: /etc/hostname
+            line: "{{ hostname }}"
+            state: present
+
+        ######################################
+        #          CHECKING network-manager  #
+        ######################################
+        - name: Check & Install NetworkManager
+          block:
+            - name: Check NetworkManager (RedHat)
+              command: rpm -q NetworkManager
+              register: nm_check
+              ignore_errors: yes
+              when: ansible_os_family == "RedHat"
+
+        - name: Install NetworkManager if missing (RedHat)
+          yum:
+            name: NetworkManager
+            state: present
+          when:
+            - ansible_os_family == "RedHat"
+            - nm_check.rc != 0
+
+        - name: Install NetworkManager (Debian)
+          apt:
+            name: network-manager
+            state: present
+            update_cache: yes
+          when: ansible_os_family == "Debian"
+
+        - name: Enable & start NetworkManager
+          systemd:
+            name: NetworkManager
+            state: started
+            enabled: yes
+
+        ######################################
+        #          CHECKING vmtools_check    #
+        ######################################
+        - name: Install open-vm-tools if needed
+          block:
+            - command: rpm -q open-vm-tools
+              register: vmtools_check
+              ignore_errors: yes
+              changed_when: false
+              when: ansible_os_family == "RedHat"
+
+            - yum:
+                name: open-vm-tools
+                state: present
+              when:
+                - ansible_os_family == "RedHat"
+                - vmtools_check.rc != 0
+
+            - systemd:
+                name: vmtoolsd
+                enabled: yes
+                state: started
+              when: ansible_os_family == "RedHat"
+
+
+        ######################################
+        #          kdump_check               #
+        ######################################
+        - name: Install kexec-tools if needed
+          block:
+            - command: rpm -q kexec-tools
+              register: kdump_check
+              ignore_errors: yes
+              changed_when: false
+              when: ansible_os_family == "RedHat"
+
+            - yum:
+                name: kexec-tools
+                state: present
+              when:
+                - ansible_os_family == "RedHat"
+                - kdump_check.rc != 0
+
+            - systemd:
+                name: kdump
+                enabled: yes
+                state: started
+              when: ansible_os_family == "RedHat"
+
+        ######################################
+        #         Sendmail CONFIGARATION     #
+        ######################################
+        - name: Sendmail setup
+          block:
+            - shell: rpm -q sendmail
+              register: sendmail_check
+              ignore_errors: yes
+              changed_when: false
+
+            - shell: rpm -q postfix
+              register: postfix_check
+              ignore_errors: yes
+              changed_when: false
+
+            - set_fact:
+                install_packages: "{{ (sendmail_check.rc != 0) and (postfix_check.rc != 0) }}"
+
+            - name: Install required packages
+              yum:
+                name:
+                  - sendmail
+                  - sendmail-cf
+                  - m4
+                  - mailx
+                state: present
+              when: install_packages
+
+            - name: Backup configs
+              copy:
+                src: "/etc/mail/{{ item }}"
+                dest: "/etc/mail/{{ item }}.bakk1"
+                remote_src: yes
+              with_items:
+                - sendmail.mc
+                - sendmail.cf
+              ignore_errors: yes
+
+            - name: Configure SMART_HOST
+              lineinfile:
+                path: /etc/mail/sendmail.mc
+                regexp: "^dnl define\\(`SMART_HOST', .*\\)"
+                line: >-
+                  dnl define(`SMART_HOST', `{{ 'dev-ent-relay.smtp.broadcom.com' if 'lnpv' in server_name
+                      else 'relay.smtp.broadcom.com' if 'lpdv' in server_name else 'invalid' }}`)dnl
+                backrefs: yes
+              when: "'lnpv' in server_name or 'lpdv' in server_name"
+
+            - name: Fail if server name is invalid
+              fail:
+                msg: "Invalid server name: must contain 'lnpv' or 'lpdv'"
+              when: "'lnpv' not in server_name and 'lpdv' not in server_name"
+
+            - name: Rebuild sendmail.cf
+              shell: m4 /etc/mail/sendmail.mc > /etc/mail/sendmail.cf
+
+            - name: Restart sendmail
+              service:
+                name: sendmail
+                state: restarted
+                enabled: yes
+
+            - name: Send test email
+              shell: echo "Testmail from {{ server_name }}" | mailx -s "Sendmail Config Test" "{{ test_email }}"
+              ignore_errors: yes
+
+        ######################################
+        #          SNOWAGENT                 #
+        ######################################
+        - name: RPM/DEB download and verification
+          block:
+
+             - name: Download and install for CentOS/RHEL
+          when: ansible_os_family == "RedHat"
+          block:
+            - name: Download RPM
+              get_url:
+                url: "{{ centos_rpm_url }}"
+                dest: "/tmp/{{ centos_rpm_file }}"
+              register: download_result_rpm
+              failed_when: download_result_rpm.failed
+
+            - name: Install RPM
+              yum:
+                name: "/tmp/{{ centos_rpm_file }}"
+                state: present
+
+            - name: Check installed RPMs
+              shell: "rpm -qa | grep epel-release || echo 'Not installed'"
+              register: rpm_check_result
+              changed_when: false
+
+        - name: Download and install for Ubuntu/Debian
+          when: ansible_os_family == "Debian"
+          block:
+            - name: Download DEB
+              get_url:
+                url: "{{ ubuntu_deb_url }}"
+                dest: "/tmp/{{ ubuntu_deb_file }}"
+              register: download_result_deb
+              failed_when: download_result_deb.failed
+
+            - name: Install DEB
+              apt:
+                deb: "/tmp/{{ ubuntu_deb_file }}"
+              register: deb_install_result
+
+            - name: Check installed DEB package
+              shell: "dpkg -l | grep hello || echo 'Not installed'"
+              register: deb_check_result
+              changed_when: false
+
+        - name: Check if /etc/cron.d exists
+          stat:
+            path: /etc/cron.d
+          register: cron_dir_result
+
+        - name: Telnet test (port {{ telnet_port }} on {{ telnet_host }})
+          shell: "timeout 5 bash -c '</dev/tcp/{{ telnet_host }}/{{ telnet_port }}' && echo 'Telnet success' || echo 'Telnet failed'"
+          register: telnet_result
+          changed_when: false
+
+        - name: SSL connectivity test (port {{ telnet_port }} on {{ telnet_host }})
+          shell: "echo | openssl s_client -connect {{ telnet_host }}:{{ telnet_port }} -servername {{ telnet_host }} 2>/dev/null | grep -i 'connected' || echo 'SSL failed'"
+          register: ssl_result
+          changed_when: false
+
+        - name: Display results
+          debug:
+            msg: |
+              {% if ansible_os_family == 'RedHat' %}
+              [CentOS/RHEL]
+              Download: {{ 'Downloaded successfully' if not download_result_rpm.failed else download_result_rpm.msg }}
+              Installed RPM: {{ rpm_check_result.stdout }}
+              {% elif ansible_os_family == 'Debian' %}
+              [Ubuntu/Debian]
+              Download: {{ 'Downloaded successfully' if not download_result_deb.failed else download_result_deb.msg }}
+              Installed DEB: {{ deb_check_result.stdout }}
+              {% endif %}
+              Cron Dir Exists: {{ cron_dir_result.stat.exists }}
+              Telnet Test: {{ telnet_result.stdout }}
+              SSL Check: {{ ssl_result.stdout }}
+
+
+        ######################################
+        #        SEP/DCS INSTALLATION        #
+        ######################################
+
+        - name: Check if SEP/DCS status script exists
+          stat:
+            path: /usr/lib/symantec/status.sh
+          register: sep_status
+
+        - name: Run SEP/DCS status script if it exists
+          command: /usr/lib/symantec/status.sh
+          register: sep_output
+          when: sep_status.stat.exists
+          failed_when: sep_output.rc != 0
+          ignore_errors: true
+
+        - name: Show SEP/DCS status check output
+          debug:
+            msg: "SEP/DCS status check passed. No installation needed."
+          when: sep_status.stat.exists and sep_output.rc == 0
+
+        - block:
+            - name: Download SEP installer
+              get_url:
+                url: "{{ installer_url }}"
+                dest: "{{ installer_path }}"
+                mode: '0755'
+
+            - name: Set execute permission on installer
+              file:
+                path: "{{ installer_path }}"
+                mode: '0755'
+
+            - name: Run SEP installer
+              command: "{{ installer_path }}"
+              args:
+                chdir: /tmp
+              register: install_output
+
+            - name: Show installer output
+              debug:
+                var: install_output.stdout_lines
+
+          when: not sep_status.stat.exists or sep_output.rc != 0
+
+        - name: Deploy DCS agent
+          block:
+            - name: Ensure DCS Agent Installer directory exists
+              file:
+                path: "{{ install_dir }}"
+                state: directory
+                mode: '0755'
+
+            - name: Copy agent binary file to remote target
+              copy:
+                src: "{{ local_agent_path }}/{{ agent_bin }}"
+                dest: "{{ remote_agent_path }}/{{ agent_bin }}"
+                mode: '0755'
+
+            - name: Copy agent cert file to remote target
+              copy:
+                src: "{{ local_agent_path }}/{{ agent_cert }}"
+                dest: "{{ remote_agent_path }}/{{ agent_cert }}"
+                mode: '0644'
+
+            - name: Run DCS Agent installer
+              command: >
+                {{ remote_agent_path }}/{{ agent_bin }}
+                -server={{ dcs_server }}
+                -secGrp={{ dcs_sec_group }}
+                -cert={{ remote_agent_path }}/{{ agent_cert }}
+                -disableIps
+                -silent
+              register: dcs_install_result
+
+            - name: Show DCS Agent installer output
+              debug:
+                var: dcs_install_result.stdout_lines
+
+        ######################################
+        #          NSCD INSTALLATION         #
+        ######################################
+
+        - name: NSCD configuration block
+          block:
+
+            - name: Install nscd package
+              yum:
+                name: "{{ nscd_package }}"
+                state: present
+
+            - name: Backup nscd.conf
+              copy:
+                src: "{{ nscd_conf_path }}"
+                dest: "{{ nscd_conf_backup }}"
+                remote_src: yes
+
+            - name: Replace 'yes' with 'no'
+              replace:
+                path: "{{ nscd_conf_path }}"
+                regexp: 'yes'
+                replace: 'no'
+
+            - name: Replace 'no' with 'yes' on hosts line
+              replace:
+                path: "{{ nscd_conf_path }}"
+                regexp: '^(hosts.*)no'
+                replace: '\1yes'
+
+            - name: Enable and start nscd service
+              systemd:
+                name: "{{ nscd_service }}"
+                enabled: yes
+                state: started
+
+            - name: Backup nsswitch.conf
+              copy:
+                src: "{{ nsswitch_conf_path }}"
+                dest: "{{ nsswitch_conf_backup }}"
+                remote_src: yes
+
+            - name: Update hosts line in nsswitch.conf
+              lineinfile:
+                path: "{{ nsswitch_conf_path }}"
+                regexp: '^hosts:.*cache'
+                line: "{{ nsswitch_hosts_line }}"
+
+            - name: Run nscd -g and capture output
+              command: nscd -g
+              register: nscd_g_output
+              changed_when: false
+
+            - name: Extract cache hit rate
+              set_fact:
+                hosts_hit_rate: "{{ (nscd_g_output.stdout | regex_search('hosts:\\s*([0-9]+)%', '\\1') | int) }}"
+              when: nscd_g_output.stdout is defined
+
+            - name: Show NSCD cache hit rate and status
+              debug:
+                msg: >-
+                  NSCD hosts cache hit rate: {{ hosts_hit_rate | default('unknown') }}% |
+                  {% if (hosts_hit_rate | int) > 1 %}
+                    Cache is running
+                  {% else %}
+                    Cache is not running
+                  {% endif %}
+        ######################################
+        #   QUALYS CLOUD AGENT INSTALLATION  #
+        ######################################
+        - name: Install and activate Qualys Cloud Agent
+          block:
+
+            - name: Copy QualysCloudAgent_Latest.rpm to target host
+              copy:
+                src: "{{ rpm_src_path }}"
+                dest: "{{ rpm_dest_path }}"
+                mode: '0644'
+              register: copy_result
+
+            - name: Show copy result
+              debug:
+                var: copy_result
+
+            - name: Install Qualys Cloud Agent RPM
+              shell: rpm -ivh "{{ rpm_dest_path }}"
+              register: install_output
+              failed_when: "'error' in (install_output.stderr | default('')).lower()"
+
+            - name: Show installation output
+              debug:
+                var: install_output.stdout_lines
+
+            - name: Run Qualys agent activation script
+              shell: >
+                {{ qualys_bin_path }}
+                ActivationId={{ activation_id }}
+                CustomerId={{ customer_id }}
+              register: activation_output
+              failed_when: "'error' in (activation_output.stderr | default('')).lower()"
+
+            - name: Show activation output
+              debug:
+                var: activation_output.stdout_lines
+
+            - name: Check Qualys agent service status
+              shell: systemctl status qualys-cloud-agent
+              register: service_status
+              failed_when: "'Active: active (running)' not in (service_status.stdout | default(''))"
+
+            - name: Show service status output
+              debug:
+                var: service_status.stdout_lines
+            ######################################
+            #   NIMSOFT                          #
+            ######################################
+
+            - name: Copy Nimsoft RPM to remote host
+              copy:
+                src: "{{ nimsoft_rpm_src }}"
+                dest: "{{ nimsoft_rpm_dest }}"
+                mode: '0644'
+              register: copy_result
+
+            - name: Show result of RPM copy
+              debug:
+                var: copy_result
+            - name: Check if Nimsoft agent is already installed
+              shell: rpm -q nimsoft-robo
+              register: nimsoft_check
+              changed_when: false
+              ignore_errors: true
+
+            - name: Install or upgrade Nimsoft RPM if not already installed
+              command: rpm -Uvh "{{ nimsoft_rpm_dest }}"
+              when: nimsoft_check.rc != 0
+              register: rpm_install
+              ignore_errors: true
+
+            - name: Show result of RPM installation (only if it ran)
+              debug:
+                var: rpm_install
+              when: nimsoft_check.rc != 0
+
+            - name: Inform if Nimsoft agent is already installed
+              debug:
+                msg: "Nimsoft agent is already installed. Skipping installation."
+              when: nimsoft_check.rc == 0
+            - name: List contents of robot.cfg directory
+              command: ls -lh "{{ robot_cfg_path | dirname }}"
+              register: cfg_contents
+
+            - name: Display directory listing
+              debug:
+                var: cfg_contents.stdout_lines
+            - name: Determine group based on input servername
+              set_fact:
+                group_type: >-
+                  {{ 'ASH' if ('lvn' in servername or 'ASH' in servername) else
+                     'SGN' if ('SGN' in servername or 'IBN' in servername) else
+                     'UNKNOWN' }}
+
+            - name: Fail if group is unknown
+              fail:
+                msg: "Unable to determine configuration group for servername: {{ servername }}"
+              when: group_type == "UNKNOWN"
+            - name: Set nms-robot-vars.cfg content for ASH
+              set_fact:
+                nms_vars_cfg: |
+                  hubip=10.34.176.141
+                  hubrobotname=wpdvumhbr020
+                  hubport=48002
+                  proxy_mode=1
+                  os_user1=GTO_Unix
+                  os_user2=GTO_ASH
+                  origin=GTO_Unix
+                  temporary_hub_broadcast = no
+              when: group_type == "ASH"
+
+            - name: Set nms-robot-vars.cfg content for SGN
+              set_fact:
+                nms_vars_cfg: |
+                  domain=wpdvuimhub01_domain
+                  hub=wpdvumhbr16_winunix_hub
+                  hubip=10.97.216.121
+                  hubrobotname=wpdvumhbr16
+                  hubport=48002
+                  proxy_mode=1
+                  os_user1=GTO_Unix
+                  os_user2=GTO_SGN
+                  origin=GTO_Unix
+              when: group_type == "SGN"
+
+            - name: Set robot.cfg content for ASH
+              set_fact:
+                robot_cfg: |
+                  <controller>
+                     hub = wpdvumhbr020_unix_hub
+                     hubrobotname = wpdvumhbr020
+                     hub_dns_name = wpdvumhbr020.broadcom.net
+                     hubport = 48002
+                     access_0 = 0
+                     access_1 = 1
+                     access_2 = 2
+                     access_3 = 3
+                     access_4 = 4
+                     os_user1 = GTO_Unix
+                     os_user2 = GTO_ASH
+                     proxy_mode = 1
+                     temporary_hub_broadcast = no
+                     reuse_async_session = 1
+                     domain = wpdvuimhub01_domain
+                     hubip = 10.34.176.141
+                     <environment>
+                      LD_LIBRARY_PATH = .:$LD_LIBRARY_PATH
+                     </environment>
+                  </controller>
+              when: group_type == "ASH"
+
+            - name: Set robot.cfg content for SGN
+              set_fact:
+                robot_cfg: |
+                  <controller>
+                     hub = wpdvumhbr16_winunix_hub
+                     hubrobotname = wpdvumhbr16
+                     hub_dns_name = wpdvumhbr16.broadcom.net
+                     hubport = 48002
+                     access_0 = 0
+                     access_1 = 1
+                     access_2 = 2
+                     access_3 = 3
+                     access_4 = 4
+                     os_user1 = GTO_Unix
+                     os_user2 = GTO_SGN
+                     temporary_hub_broadcast = no
+                     proxy_mode = 1
+                     reuse_async_session = 1
+                     domain = wpdvuimhub01_domain
+                     hubip = 10.97.216.121
+                     <environment>
+                      LD_LIBRARY_PATH = .:$LD_LIBRARY_PATH
+                     </environment>
+                  </controller>
+              when: group_type == "SGN"
+            - name: Backup existing nms-robot-vars.cfg
+              copy:
+                src: "{{ nms_vars_cfg_path }}"
+                dest: "{{ nms_vars_cfg_path }}.bak"
+                remote_src: yes
+              ignore_errors: yes
+
+            - name: Write updated nms-robot-vars.cfg
+              copy:
+                content: "{{ nms_vars_cfg }}"
+                dest: "{{ nms_vars_cfg_path }}"
+                mode: '0644'
+
+            - name: Show updated nms-robot-vars.cfg content
+              command: cat "{{ nms_vars_cfg_path }}"
+              register: nms_out
+
+            - name: Display updated nms-robot-vars.cfg
+              debug:
+                var: nms_out.stdout_lines
+
+            - name: Backup existing robot.cfg
+              copy:
+                src: "{{ robot_cfg_path }}"
+                dest: "{{ robot_cfg_path }}.bak"
+                remote_src: yes
+              ignore_errors: yes
+
+            - name: Write updated robot.cfg
+              copy:
+                content: "{{ robot_cfg }}"
+                dest: "{{ robot_cfg_path }}"
+                mode: '0644'
+
+            - name: Show updated robot.cfg content
+              command: cat "{{ robot_cfg_path }}"
+              register: robot_out
+
+            - name: Display updated robot.cfg
+              debug:
+                var: robot_out.stdout_lines
+
+
+
+
+
+
+
+      rescue:
+
+        - name: Set failure flag and error message
+          set_fact:
+            script_success: false
+            error_message: "An error occurred. Check above logs for details."
+
+      always:
+
+        - name: Final Status Message
+          debug:
+            msg: >-
+              {% if script_success %}
+               Script completed successfully!
+              {% else %}
+               Script failed: {{ error_message }}
+              {% endif %}
+

@@ -1,0 +1,185 @@
+---
+- name: Get server deatails exit ot not exit
+  hosts: localhost
+  gather_facts: false
+
+  vars:
+    python_path: "/usr/bin/python3"   # Adjust to your Python path
+    script_path: "new_vlan_script.py"  # Adjust path
+    vcenter_username: 'BRCMLTD\wasvcuser'
+    url: "https://wpdvcy.net-wasvcuser"
+    target_vm_name: "{{ fqdn_name }}"
+    site_input: "{{ site_name }}"
+    subnet: "{{ subnet }}"
+    vcenter_map:
+      lvn: "lvn-zm1w1.net"
+      ibn: "ibn-hm1wom.net"
+      sgn: "sgn-hm1wnet"
+      ams: "ams-hm1com.net"
+      acc: "acc-hmcom.net"
+      tky: "tky-h-vm.net"
+
+  tasks:
+    - block:
+        - name: Normalize input to lowercase
+          set_fact:
+            site_lc: "{{ site_input | lower() | trim() }}"
+
+        - name: Match site code in a case-insensitive way
+          set_fact:
+            selected_vcenter: "{{ vcenter_map[item] }}"
+          loop: "{{ vcenter_map.keys() | list }}"
+          when:
+            - site_lc is defined
+            - (site_lc.find(item | lower) != -1)
+            - (selected_vcenter is not defined)
+          run_once: true
+
+        - name: Fail if no matching vCenter found
+          fail:
+            msg: "No vCenter found for the given site name '{{ site_input }}'"
+          when: selected_vcenter is not defined
+          run_once: true
+
+        - name: Show selected vCenter
+          debug:
+            msg:
+              - "site_input: {{ site_input }}"
+              - "normalized: {{ site_lc }}"
+              - "selected_vcenter: {{ selected_vcenter }}"
+
+        - name: Call AIM API to fetch credential
+          uri:
+            url: "{{ url }}"
+            method: GET
+            validate_certs: false
+            return_content: true
+          register: password_response
+
+        - name: Extract password from API response
+          set_fact:
+            password: "{{ (password_response.content | from_json).Content }}"
+
+        - name: Print password 
+          debug:
+            var: password
+
+        - name: Execute VLAN Python Script
+          ansible.builtin.command: >
+            {{ python_path }} {{ script_path }}
+          environment:
+            password: "{{ password }}"
+            vcenter: "{{ selected_vcenter }}"
+            TARGET_VLAN: "{{ VLAN }}"
+          register: vlan_output
+          ignore_errors: yes
+
+        - name: Show Script Output
+          ansible.builtin.debug:
+            var: vlan_output.stdout_lines
+
+        - name: Find the VLAN dictionary line
+          set_fact:
+            vlan_dict_line_raw: >-
+              {{ vlan_output.stdout_lines
+                 | select('search', '{')
+                 | list
+                 | last
+                 | default('', true) }}
+
+        - name: Convert VLAN line to string
+          set_fact:
+            vlan_dict_line: "{{ vlan_dict_line_raw | string }}"
+
+        - name: Debug VLAN dictionary line
+          debug:
+            var: vlan_dict_line
+
+        - name: Extract VLAN details safely
+          set_fact:
+            datacenter: "{{ vlan_dict_line | regex_search(\"'Datacenter': '([^']+)'\", '\\1') | default('N/A', true) }}"
+            cluster: "{{ vlan_dict_line | regex_search(\"'Cluster': '([^']+)'\", '\\1') | default('N/A', true) }}"
+            portgroup: "{{ vlan_dict_line | regex_search(\"'PortGroup': '([^']+)'\", '\\1') | default('N/A', true) }}"
+            switch: "{{ vlan_dict_line | regex_search(\"'Switch': '([^']+)'\", '\\1') | default('N/A', true) }}"
+            vlan_id: "{{ vlan_dict_line | regex_search(\"'VLAN_ID': ([^,}]+)\", '\\1') | default('N/A', true) }}"
+
+        - name: Show extracted VLAN details
+          debug:
+            msg:
+              - "Datacenter: {{ datacenter }}"
+              - "Cluster: {{ cluster }}"
+
+        - name: Call AIM API to fetch credential again
+          uri:
+            url: "{{ url }}"
+            method: GET
+            validate_certs: false
+            return_content: true
+          register: password_response
+
+        - name: Extract password from API response
+          set_fact:
+            vcenter_password: "{{ (password_response.content | from_json).Content }}"
+
+        - name: Show extracted password
+          debug:
+            msg: "Fetched password: {{ vcenter_password }}"
+
+        - name: Gather VM info
+          vmware_guest_facts:
+            hostname: "{{ selected_vcenter }}"
+            username: "{{ vcenter_username }}"
+            password: "{{ vcenter_password }}"
+            validate_certs: no
+            name: "{{ target_vm_name }}"
+            datacenter: "{{ datacenter }}"
+          register: vm_info
+
+        - name: Set success fact
+          set_fact:
+            vm_lookup_status: "SUCCESS"
+            vm_lookup_message: >-
+              {% if vm_info.instance is defined %}
+                VM "{{ target_vm_name }}" present in vCenter.
+              {% else %}
+                VM "{{ target_vm_name }}" does not exist in vCenter.
+              {% endif %}
+
+        - name: Show whether VM exists
+          debug:
+            msg: "{{ vm_lookup_message }}"
+
+        - name: Updating worknotes for success scenario
+          include_tasks:
+            file: webhook_update.yml
+          vars:
+            Sr_Number: "{{ SR_ID }}"
+            subnet: "{{ subnet }}"
+            task_id: "{{ Network_Task_id }}"
+            execution_status: "Success"
+            execution_output: "{{ vm_lookup_message }}"
+
+      rescue:
+        - name: Set failure fact
+          set_fact:
+            vm_lookup_status: "FAILED"
+            vm_lookup_message: "Failed to gather VM info for '{{ target_vm_name }}'."
+
+        - name: Show failure message
+          debug:
+            msg: "{{ vm_lookup_message }}"
+
+        - name: Updating worknotes for failure scenario
+          include_tasks:
+            file: webhook_update.yml
+          vars:
+            Sr_Number: "{{ SR_ID }}"
+            task_id: "{{ Network_Task_id }}"
+            execution_status: "Failed"
+            execution_output: "{{ vm_lookup_message }}"
+            subnet: "{{ subnet }}"
+
+      always:
+        - name: Log completion status
+          debug:
+            msg: "Playbook execution finished for VM '{{ target_vm_name }}' with status: {{ vm_lookup_status }}"
